@@ -436,7 +436,7 @@ tf_cc_test(
     ],
 )
 
-tf_cc_test(
+tf_cuda_cc_test(
     name = "embedding_variable_ops_test",
     srcs = ["embedding_variable_ops_test.cc"],
     extra_copts = ["-fexceptions", "-g"],
@@ -2843,6 +2843,7 @@ tf_kernel_library(
         ":state",
         ":training_op_helpers",
         ":variable_ops",
+        "//tensorflow/core:embedding_gpu",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:kv_variable_ops_op_lib",
@@ -4744,7 +4745,7 @@ tf_kernel_library(
 
 tf_cc_test(
     name = "bias_grad_ali_op_test",
-    size = "large",
+    size = "small",
     srcs = ["bias_grad_ali_op_test.cc"],
     deps = [
         ":bias_grad_ali_op",
@@ -5638,7 +5639,9 @@ tf_kernel_library(
     prefix = "sparse_to_dense_op",
     deps = SPARSE_DEPS + [
         "//third_party/eigen3",
-    ],
+    ] + if_cuda([
+        ":gpu_utils",
+    ]),
 )
 
 tf_kernel_library(

@@ -80,6 +80,7 @@ load(
     "tf_cc_tests",
     "tf_copts",
     "tf_cuda_library",
+    "cuda_library",
     "tf_cuda_only_cc_test",
     "tf_features_nomodules_if_android",
     "tf_features_nomodules_if_emscripten",
@@ -128,6 +129,7 @@ load(
     "tf_additional_numa_lib_defines",
     "tf_additional_star_lib_defines",
     "tf_additional_pmem_lib_defines",
+    "tf_additional_gpu_ev_lib_defines",
     "tf_additional_test_deps",
     "tf_additional_verbs_lib_defines",
     "tf_grpc_service_all",
@@ -971,6 +973,8 @@ tf_cuda_library(
         ":framework_internal",
         "@com_google_absl//absl/base",
         "@sparsehash_c11//:dense_hash_map",
+        "@com_github_google_leveldb//:leveldb",
+        "//tensorflow/stream_executor/lib",
     ],
 )
 
@@ -2509,7 +2513,8 @@ LIB_INTERNAL_DEFINES = (
     tf_additional_gdr_lib_defines() +
     tf_additional_numa_lib_defines() +
     tf_additional_star_lib_defines() +
-    tf_additional_pmem_lib_defines()
+    tf_additional_pmem_lib_defines() +
+    tf_additional_gpu_ev_lib_defines()
 )
 
 cc_library(
@@ -2988,6 +2993,8 @@ tf_cuda_library(
             "util/stats_calculator.*",
             "util/version_info.cc",
             "util/env_var.cc",
+            "framework/embedding/batch.cu.cc",
+            "framework/embedding/batch.h"
         ],
     ) + select({
         "//tensorflow:windows": [],
@@ -3018,6 +3025,8 @@ tf_cuda_library(
         ":stats_calculator_portable",
         ":version_lib",
         ":framework_internal_impl_hash_table",
+        ":embedding_gpu",
+        "//tensorflow/stream_executor/lib",
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -5907,4 +5916,31 @@ cc_library(
         "//tensorflow/core/platform:types",
         "//third_party/eigen3",
     ],
+)
+
+cuda_library(
+    name = "embedding_gpu",
+    hdrs = [
+        "framework/embedding/batch.h"
+    ],
+    srcs = FRAMEWORK_INTERNAL_PRIVATE_HEADERS + [
+        "framework/embedding/batch.cu.cc"
+    ],
+    copts = ["-g"] + if_cuda(["-DNV_CUDNN_DISABLE_EXCEPTION"])
+        + if_cuda(["-DGOOGLE_CUDA=1"]) +
+	select({
+        "//conditions:default": [],
+        "@local_config_cuda//cuda:using_nvcc": [
+            #"-nvcc_options=relaxed-constexpr",
+            #"-nvcc_options=ftz=true",
+        ],
+        "@local_config_cuda//cuda:using_clang": [
+            "-fcuda-flush-denormals-to-zero",
+        ],
+        }),
+    nocopts = "-fno-exceptions",
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+    deps = ["//tensorflow/stream_executor/cuda:cudart_stub",
+	    ":stream_executor"]
 )
