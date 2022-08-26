@@ -1630,6 +1630,7 @@ cc_library(
         "//tensorflow/core/kernels:fused_embedding_ops",
         "//tensorflow/core/kernels/data:parquet_dataset_ops",
         "//tensorflow/core/kernels:fused_l2_normalize_ops",
+        "//tensorflow/core/kernels:fused_layer_normalize_ops",
         "//tensorflow/core/kernels:grappler",
         "//tensorflow/core/kernels:hash_ops",
         "//tensorflow/core/kernels:histogram_op",
@@ -3569,9 +3570,11 @@ cc_library(
 
 tf_cuda_library(
     name = "direct_session_internal",
-    srcs = ["common_runtime/direct_session.cc"],
+    srcs = ["common_runtime/direct_session.cc",
+            "common_runtime/direct_session_group.cc"],
     hdrs = [
         "common_runtime/direct_session.h",
+        "common_runtime/direct_session_group.h",
         "util/env_var.h",
     ],
     copts = tf_copts(),

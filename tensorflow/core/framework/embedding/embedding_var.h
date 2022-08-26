@@ -99,6 +99,11 @@ class EmbeddingVar : public ResourceBase {
         default_value_ = TypedAllocator::Allocate<V>(alloc_, default_tensor.NumElements(), AllocationAttributes());
         auto default_tensor_flat = default_tensor.flat<V>();
         memcpy(default_value_, &default_tensor_flat(0), default_tensor.TotalBytes());
+
+        default_value_no_permission_ = TypedAllocator::Allocate<V>(alloc_, value_len_, AllocationAttributes());
+        for (int i = 0; i < value_len_; ++i) {
+          default_value_no_permission_[i] = static_cast<V>(emb_config_.default_value_no_permission);
+        }
       }
       if (LayoutType::NORMAL_CONTIGUOUS == storage_manager_->GetLayoutType()) {
         storage_manager_->SetAllocLen(value_len_, emb_config_.slot_num + 1);
@@ -156,7 +161,8 @@ class EmbeddingVar : public ResourceBase {
   void LookupOrCreate(K key, V* val, V* default_v, int count = 1)  {
     const V* default_value_ptr = (default_v == nullptr) ? default_value_ : default_v;
     ValuePtr<V>* value_ptr = nullptr;
-    filter_->LookupOrCreate(key, val, default_value_ptr, &value_ptr, count);
+    filter_->LookupOrCreate(key, val, default_value_ptr, &value_ptr, count,
+                            default_value_no_permission_);
     add_freq_fn_(value_ptr, count, emb_config_.filter_freq);
   }
 
@@ -382,7 +388,8 @@ class EmbeddingVar : public ResourceBase {
       if (buffer1_size != 0) {
         alloc_->DeallocateRaw(buffer1);
       }
-      buffer1 = (V**)alloc_->AllocateRaw(0, size * sizeof(V*));
+      buffer1 = (V**)alloc_->AllocateRaw(Allocator::kAllocatorAlignment,
+        size * sizeof(V*));
       buffer1_size = size;
       return buffer1;
     }
@@ -395,7 +402,8 @@ class EmbeddingVar : public ResourceBase {
       if (buffer2_size != 0) {
         alloc_->DeallocateRaw(buffer2);
       }
-      buffer2 =(V**)alloc_->AllocateRaw(0, size * sizeof(V*));
+      buffer2 =(V**)alloc_->AllocateRaw(Allocator::kAllocatorAlignment,
+        size * sizeof(V*));
       buffer2_size = size;
       return buffer2;
     }
@@ -408,7 +416,8 @@ class EmbeddingVar : public ResourceBase {
       if (buffer3_size != 0) {
         alloc_->DeallocateRaw(buffer3);
       }
-      buffer3 = (V**)alloc_->AllocateRaw(0, size * sizeof(V*));
+      buffer3 = (V**)alloc_->AllocateRaw(Allocator::kAllocatorAlignment,
+        size * sizeof(V*));
       buffer3_size = size;
       return buffer3;
     }
@@ -421,6 +430,7 @@ class EmbeddingVar : public ResourceBase {
   mutex mu_;
 
   V* default_value_;
+  V* default_value_no_permission_;
   V **buffer1, **buffer2, **buffer3;
   int64 buffer1_size, buffer2_size, buffer3_size;
   int64 value_len_;
@@ -455,6 +465,7 @@ class EmbeddingVar : public ResourceBase {
       }
     }
     TypedAllocator::Deallocate(alloc_, default_value_, value_len_);
+    TypedAllocator::Deallocate(alloc_, default_value_no_permission_, value_len_);
   }
   TF_DISALLOW_COPY_AND_ASSIGN(EmbeddingVar);
 };
