@@ -10,6 +10,7 @@ namespace processor {
 struct ModelConfig {
 
   // Model Info
+  bool enable_incr_model_update = true;
   std::string checkpoint_dir;
   std::string savedmodel_dir;
   std::string signature_name;
@@ -59,6 +60,7 @@ struct ModelConfig {
   // EmbeddingVariable Config
   embedding::StorageType storage_type = embedding::StorageType::INVALID;
   std::string storage_path;
+  std::vector<int64> storage_size;
 };
 
 class ModelConfigFactory {

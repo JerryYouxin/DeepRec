@@ -78,8 +78,8 @@ class DBIterator : public Iterator {
   }
   virtual void Value(char* val, int64 dim, int64 value_offset) {
     memcpy(val,
-           it_->value().ToString().data() + value_offset + sizeof(FixedLengthHeader),
-           dim);
+           it_->value().ToString().data() +
+               value_offset + sizeof(FixedLengthHeader), dim);
   }
  private:
   leveldb::Iterator* it_;
@@ -89,12 +89,15 @@ template <class K, class V>
 class LevelDBKV : public KVInterface<K, V> {
  public:
   LevelDBKV(std::string path) {
-    path_ = io::JoinPath(path, "level_db_" + std::to_string(Env::Default()->NowMicros()));;
+    path_ = io::JoinPath(path,
+        "level_db_" + std::to_string(Env::Default()->NowMicros()));;
     options_.create_if_missing = true;
     leveldb::Status s = leveldb::DB::Open(options_, path_, &db_);
     CHECK(s.ok());
     counter_ =  new SizeCounter<K>(8);
-    new_value_ptr_fn_ = [] (size_t size) { return new NormalContiguousValuePtr<V>(cpu_allocator(), size); };
+    new_value_ptr_fn_ = [] (size_t size) {
+      return new NormalContiguousValuePtr<V>(ev_allocator(), size);
+    };
     total_dims_ = 0;
   }
 
@@ -127,14 +130,17 @@ class LevelDBKV : public KVInterface<K, V> {
     return Status::OK();
   }
 
-  Status BatchInsert(std::vector<K> keys, std::vector<ValuePtr<V>*> value_ptrs) {
+  Status BatchInsert(const std::vector<K>& keys,
+                     const std::vector<ValuePtr<V>*>& value_ptrs) {
     return BatchCommit(keys, value_ptrs);
   } 
 
-  Status BatchCommit(std::vector<K> keys, std::vector<ValuePtr<V>*> value_ptrs) {
+  Status BatchCommit(const std::vector<K>& keys,
+                     const std::vector<ValuePtr<V>*>& value_ptrs) {
     WriteBatch batch;
     for (int i = 0; i < keys.size(); i++) {
-      std::string value_res((char*)value_ptrs[i]->GetPtr(), sizeof(FixedLengthHeader) + total_dims_ * sizeof(V));
+      std::string value_res((char*)value_ptrs[i]->GetPtr(),
+          sizeof(FixedLengthHeader) + total_dims_ * sizeof(V));
       leveldb::Slice db_key((char*)(&keys[i]), sizeof(void*));
       batch.Put(db_key, value_res);
       delete value_ptrs[i];
@@ -144,7 +150,8 @@ class LevelDBKV : public KVInterface<K, V> {
   }
 
   Status Commit(K key, const ValuePtr<V>* value_ptr) {
-    std::string value_res((char*)value_ptr->GetPtr(), sizeof(FixedLengthHeader) + total_dims_ * sizeof(V));
+    std::string value_res((char*)value_ptr->GetPtr(),
+        sizeof(FixedLengthHeader) + total_dims_ * sizeof(V));
     leveldb::Slice db_key((char*)(&key), sizeof(void*));
     leveldb::Status s = db_->Put(WriteOptions(), db_key, value_res);
     if (!s.ok()){
@@ -167,7 +174,8 @@ class LevelDBKV : public KVInterface<K, V> {
     }
   }
 
-  Status GetSnapshot(std::vector<K>* key_list, std::vector<ValuePtr<V>* >* value_ptr_list) {
+  Status GetSnapshot(std::vector<K>* key_list,
+      std::vector<ValuePtr<V>* >* value_ptr_list) {
     return Status::OK();
   }
 

@@ -4,19 +4,22 @@
 
 **CPU Base Docker Image**
 
-```
-alideeprec/deeprec-base:deeprec-base-cpu-py36-ubuntu18.04
-```
+| GCC Version | Python Version |                           IMAGE                           |
+| ----------- | -------------- | --------------------------------------------------------- |
+|   7.5.0     |    3.6.9       | alideeprec/deeprec-base:deeprec-base-cpu-py36-ubuntu18.04 |
+|   11.2.0    |    3.8.6       | alideeprec/deeprec-base:deeprec-base-cpu-py38-ubuntu22.04 |
+
 
 **GPU Base Docker Image**
 
-| CUDA VERSION |                           IMAGE                                 |
-| ------------ | --------------------------------------------------------------- |
-| CUDA 11.0.3  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu110-ubuntu18.04 |
-| CUDA 11.2.2  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu112-ubuntu18.04 |
-| CUDA 11.4.2  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu114-ubuntu18.04 |
-| CUDA 11.6.1  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu116-ubuntu18.04 |
-| CUDA 11.7.1  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu117-ubuntu18.04 |
+| GCC Version | Python Version | CUDA VERSION |                           IMAGE                                 |
+| ----------- | -------------- | ------------ | --------------------------------------------------------------- |
+|    7.5.0    |    3.6.9       | CUDA 11.0.3  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu110-ubuntu18.04 |
+|    7.5.0    |    3.6.9       | CUDA 11.2.2  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu112-ubuntu18.04 |
+|    7.5.0    |    3.6.9       | CUDA 11.4.2  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu114-ubuntu18.04 |
+|    7.5.0    |    3.6.9       | CUDA 11.6.1  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu116-ubuntu18.04 |
+|    7.5.0    |    3.6.9       | CUDA 11.7.1  | alideeprec/deeprec-base:deeprec-base-gpu-py36-cu117-ubuntu18.04 |
+|    11.2.0   |    3.8.6       | CUDA 11.7.1  | alideeprec/deeprec-base:deeprec-base-gpu-py38-cu117-ubuntu22.04 |
 
 **CPU Dev Docker (with bazel cache)**
 
@@ -24,10 +27,10 @@ alideeprec/deeprec-base:deeprec-base-cpu-py36-ubuntu18.04
 alideeprec/deeprec-build:deeprec-dev-cpu-py36-ubuntu18.04
 ```
 
-**GPU(cuda11.0) Dev Docker (with bazel cache)**
+**GPU(cuda11.6) Dev Docker (with bazel cache)**
 
 ```
-alideeprec/deeprec-build:deeprec-dev-gpu-py36-cu110-ubuntu18.04
+alideeprec/deeprec-build:deeprec-dev-gpu-py36-cu116-ubuntu18.04
 ```
 
 ## 代码编译
@@ -92,16 +95,16 @@ pip3 install /tmp/tensorflow_pkg/tensorflow-1.15.5+${version}-cp36-cp36m-linux_x
 
 ## 最新Release镜像
 
-**GPU CUDA11.0镜像**
-
-```
-alideeprec/deeprec-release:deeprec2206-gpu-py36-cu110-ubuntu18.04
-```
-
 **CPU镜像**
 
 ```
-alideeprec/deeprec-release:deeprec2206-cpu-py36-ubuntu18.04
+alideeprec/deeprec-release:deeprec2208-cpu-py36-ubuntu18.04
+```
+
+**GPU CUDA11.6镜像**
+
+```
+alideeprec/deeprec-release:deeprec2208-gpu-py36-cu116-ubuntu18.04
 ```
 
 ## DeepRec Processor编译打包

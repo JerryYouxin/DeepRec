@@ -106,6 +106,10 @@ struct LocalDevice::EigenThreadPoolInfo {
     delete eigen_worker_threads_.workers;
   }
 
+  void SetThreadPoolAffinity(const cpu_set_t& cpuset) {
+    eigen_worker_threads_.workers->SetThreadPoolAffinity(cpuset);
+  }
+
   DeviceBase::CpuWorkerThreads eigen_worker_threads_;
   std::unique_ptr<Eigen::ThreadPoolDevice> eigen_device_;
   std::unique_ptr<EigenAllocator> eigen_allocator_;
@@ -114,18 +118,20 @@ struct LocalDevice::EigenThreadPoolInfo {
 LocalDevice::LocalDevice(const SessionOptions& options,
                          const DeviceAttributes& attributes)
     : Device(options.env, attributes), owned_tp_info_(nullptr) {
-  Init(options, attributes);
+  Init(options, attributes, DeviceGlobalThreadPoolOptions());
 }
 
 LocalDevice::LocalDevice(const SessionOptions& options,
                          const DeviceAttributes& attributes,
-                         const DeviceResourceMgrMap* dev_rmgr_map)
+                         const DeviceResourceMgrMap* dev_rmgr_map,
+                         const DeviceGlobalThreadPoolOptions& opt)
     : Device(options.env, attributes, dev_rmgr_map), owned_tp_info_(nullptr) {
-  Init(options, attributes);
+  Init(options, attributes, opt);
 }
 
 void LocalDevice::Init(const SessionOptions& options,
-                       const DeviceAttributes& attributes) {
+                       const DeviceAttributes& attributes,
+                       const DeviceGlobalThreadPoolOptions& opt) {
   // Log info messages if TensorFlow is not compiled with instructions that
   // could speed up performance and are available on the current CPU.
   port::InfoAboutUnusedCPUFeatures();
@@ -152,11 +158,36 @@ void LocalDevice::Init(const SessionOptions& options,
       }
       tp_info = global_tp_info_[numa_node];
     } else {
-      if (global_tp_info_.empty()) {
-        global_tp_info_.push_back(new LocalDevice::EigenThreadPoolInfo(
-            options, port::kNUMANoAffinity, nullptr));
+      if (opt.global_threadpool_num > 1) {
+        for (int i = 0; i < opt.global_threadpool_num; ++i) {
+          global_tp_info_.push_back(nullptr);
+        }
+        if (!global_tp_info_[opt.device_threadpool_index]) {
+          global_tp_info_[opt.device_threadpool_index] =
+              new LocalDevice::EigenThreadPoolInfo(
+                  options, port::kNUMANoAffinity, nullptr);
+          // set threadpool affinity
+          if (opt.cpuset.size() > 0) {
+            std::string msg;
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            for (auto c : opt.cpuset) {
+              CPU_SET(c, &cpuset);
+              msg = msg + std::to_string(c) + ", ";
+            }
+            global_tp_info_[opt.device_threadpool_index]->SetThreadPoolAffinity(cpuset);
+            LOG(INFO) << "Intra thread pool #" << opt.device_threadpool_index
+                      << " will be pinned to cpus: " << msg;
+          }
+        }
+        tp_info = global_tp_info_[opt.device_threadpool_index];
+      } else {
+        if (global_tp_info_.empty()) {
+          global_tp_info_.push_back(new LocalDevice::EigenThreadPoolInfo(
+              options, port::kNUMANoAffinity, nullptr));
+        }
+        tp_info = global_tp_info_[0];
       }
-      tp_info = global_tp_info_[0];
     }
   } else {
     // Each LocalDevice owns a separate ThreadPoolDevice for numerical

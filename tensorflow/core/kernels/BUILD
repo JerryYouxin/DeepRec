@@ -34,7 +34,6 @@ load(
 )
 load(
     "//third_party/mkl:build_defs.bzl",
-    "if_mkl_ml",
     "mkl_deps",
 )
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
@@ -3962,7 +3961,6 @@ cc_library(
     deps = [
         ":aggregate_ops",
         ":argmax_op",
-        ":batch_matmul_op",
         ":betainc_op",
         ":bincount_op",
         ":bucketize_op",
@@ -3999,19 +3997,35 @@ tf_kernel_library(
 
 tf_kernel_library(
     name = "batch_matmul_op",
+    deps = [":matmul_op"],
+)
+
+tf_kernel_library(
+    name = "matmul_op",
     # <prefix>*impl.h are excluded by default from the CPU build, add explicitly.
-    hdrs = ["batch_matmul_op_impl.h"],
-    prefix = "batch_matmul_op",
-    deps = MATH_DEPS + [":eigen_contraction_kernel"] + if_mkl_ml([
-        "//third_party/mkl:intel_binary_blob",
-    ]),
+    hdrs = ["matmul_op_impl.h"],
+    defines = select({
+        ":xsmm": ["TENSORFLOW_USE_LIBXSMM"],
+        "//conditions:default": [],
+    }),
+    prefix = "matmul_op",
+    deps = MATH_DEPS + [
+        ":eigen_contraction_kernel",
+        ":fused_eigen_output_kernels",
+    ] + select({
+        ":xsmm": ["@libxsmm_archive//:xsmm_avx"],
+        "//conditions:default": [],
+    }) + mkl_deps() + if_cuda([
+        "//tensorflow/core/platform/default/build_config:cublas_plugin",
+        "//tensorflow/stream_executor:matmul_util",
+    ]) + if_cuda_or_rocm([":gpu_utils"]),
 )
 
 tf_mkl_kernel_library(
     name = "mkl_batch_matmul_op",
     srcs = ["mkl_batch_matmul_op.cc"],
     hdrs = [
-        "batch_matmul_op_impl.h",
+        "matmul_op_impl.h",
         "mkl_matmul_ops_common.h",
         "no_op.h"
     ],
@@ -4107,30 +4121,6 @@ tf_kernel_library(
     ]
 )
 
-tf_kernel_library(
-    name = "matmul_op",
-    srcs = [
-        "matmul_op.cc",
-        "matmul_op_fused.cc",
-    ],
-    hdrs = ["matmul_op.h"],
-    defines = select({
-        ":xsmm": ["TENSORFLOW_USE_LIBXSMM"],
-        "//conditions:default": [],
-    }),
-    deps = MATH_DEPS + [
-        ":eigen_contraction_kernel",
-        ":fused_eigen_output_kernels",
-        ":ops_util",
-        ":gpu_utils",
-    ] + select({
-        ":xsmm": ["@libxsmm_archive//:xsmm_avx"],
-        "//conditions:default": [],
-    }) + mkl_deps() + if_cuda([
-        "//tensorflow/core/platform/default/build_config:cublas_plugin",
-    ]),
-)
-
 tf_mkl_kernel_library(
     name = "mkl_matmul_op",
     srcs = [
@@ -4178,6 +4168,7 @@ tf_cc_test(
     srcs = [
         "fused_layer_norm/fused_layer_normalize_ops_test.cc",
     ],
+    extra_copts = ["-fexceptions"],
     deps = [
         ":fused_layer_normalize_ops",
         ":ops_testutil",
@@ -4391,25 +4382,6 @@ tf_cuda_cc_test(
         "//tensorflow/core:test_main",
         "//tensorflow/core:testlib",
         "@com_google_absl//absl/algorithm:container",
-    ],
-)
-
-tf_cuda_cc_test(
-    name = "batch_matmul_op_test",
-    size = "small",
-    srcs = ["batch_matmul_op_test.cc"],
-    deps = [
-        ":batch_matmul_op",
-        ":broadcast_to_op",
-        ":ops_testutil",
-        ":ops_util",
-        "//tensorflow/core:core_cpu",
-        "//tensorflow/core:framework",
-        "//tensorflow/core:lib",
-        "//tensorflow/core:protos_all_cc",
-        "//tensorflow/core:test",
-        "//tensorflow/core:test_main",
-        "//tensorflow/core:testlib",
     ],
 )
 
@@ -5379,6 +5351,7 @@ tf_cc_test(
     name = "embedding_lookup_sparse_pre_op_test",
     size = "small",
     srcs = ["fused_embedding/embedding_lookup_sparse_pre_op_test.cc"],
+    extra_copts = ["-fexceptions"],
     deps = [
         ":fused_embedding_ops",
         ":ops_testutil",
@@ -5400,6 +5373,7 @@ tf_cc_test(
     name = "embedding_lookup_sparse_post_op_test",
     size = "small",
     srcs = ["fused_embedding/embedding_lookup_sparse_post_op_test.cc"],
+    extra_copts = ["-fexceptions"],
     deps = [
         ":fused_embedding_ops",
         ":ops_testutil",
@@ -5421,6 +5395,7 @@ tf_cc_test(
     name = "embedding_lookup_sparse_post_grad_op_test",
     size = "small",
     srcs = ["fused_embedding/embedding_lookup_sparse_post_grad_op_test.cc"],
+    extra_copts = ["-fexceptions"],
     deps = [
         ":fused_embedding_ops",
         ":ops_testutil",
@@ -5452,6 +5427,7 @@ tf_cc_test(
     size = "small",
     srcs = ["fused_l2_normalize/fused_l2_normalize_op_test.cc",
         "fused_l2_normalize/fused_l2_normalize_grad_op_test.cc"],
+    extra_copts = ["-fexceptions"],
     deps = [
         ":fused_l2_normalize_ops",
         ":ops_testutil",
@@ -6780,8 +6756,8 @@ filegroup(
         "identity_op.h",
         "immutable_constant_op.cc",
         "immutable_constant_op.h",
-        "matmul_op.cc",
-        "matmul_op.h",
+        "matmul_op_impl.h",
+        "matmul_op_real.cc",
         "no_op.cc",
         "no_op.h",
         "non_max_suppression_op.cc",
@@ -6857,7 +6833,6 @@ filegroup(
     srcs = [
         "argmax_op.h",
         "avgpooling_op.h",
-        "batch_matmul_op_impl.h",
         "batch_norm_op.h",
         "control_flow_ops.h",
         "conv_2d.h",
@@ -6928,7 +6903,6 @@ filegroup(
     srcs = [
         "argmax_op.cc",
         "avgpooling_op.cc",
-        "batch_matmul_op_real.cc",
         "batch_norm_op.cc",
         "bcast_ops.cc",
         "check_numerics_op.cc",

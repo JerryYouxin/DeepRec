@@ -21,6 +21,7 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/common_runtime/device.h"
+#include "tensorflow/core/common_runtime/local_device.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
@@ -119,13 +120,15 @@ Status DeviceFactory::ListAllPhysicalDevices(std::vector<string>* devices) {
 Status DeviceFactory::AddDevices(
     const SessionOptions& options, const string& name_prefix,
     std::vector<std::unique_ptr<Device>>* devices) {
-  return AddDevices(options, name_prefix, devices, nullptr);
+  return AddDevices(options, name_prefix, devices, nullptr,
+                    DeviceGlobalThreadPoolOptions());
 }
 
 Status DeviceFactory::AddDevices(
     const SessionOptions& options, const string& name_prefix,
     std::vector<std::unique_ptr<Device>>* devices,
-    const DeviceResourceMgrMap* dev_rmgr_map) {
+    const DeviceResourceMgrMap* dev_rmgr_map,
+    const DeviceGlobalThreadPoolOptions& opt) {
   // CPU first. A CPU device is required.
   auto cpu_factory = GetFactory("CPU");
   if (!cpu_factory) {
@@ -134,7 +137,7 @@ Status DeviceFactory::AddDevices(
   }
   size_t init_size = devices->size();
   TF_RETURN_IF_ERROR(cpu_factory->CreateDevices(
-      options, name_prefix, devices, dev_rmgr_map));
+      options, name_prefix, devices, dev_rmgr_map, opt));
   if (devices->size() == init_size) {
     return errors::NotFound("No CPU devices are available in this process");
   }
@@ -145,9 +148,9 @@ Status DeviceFactory::AddDevices(
     auto factory = p.second.factory.get();
     if (factory != cpu_factory) {
       // Now only support "CPU" and "GPU" device
-      if (p.first == "GPU") {
+      if (p.first == "GPU" || p.first == "XLA_CPU" || p.first == "XLA_GPU") {
         TF_RETURN_IF_ERROR(factory->CreateDevices(
-            options, name_prefix, devices, dev_rmgr_map));
+            options, name_prefix, devices, dev_rmgr_map, opt));
       } else {
         TF_RETURN_IF_ERROR(factory->CreateDevices(
             options, name_prefix, devices));

@@ -203,6 +203,7 @@ message GPUOptions {
   // to API stability guarantees in
   // https://www.tensorflow.org/guide/version_compat.
   Experimental experimental = 9;
+  bool cuda_graph_mode_compatible = 10;
 }
 
 // Options passed to the graph optimizer
@@ -256,6 +257,9 @@ message OptimizerOptions {
   int32 micro_batch_num = 9;
   bool do_smart_stage = 10;
   bool do_smart_stage_gpu = 11;
+  bool do_async_embedding = 12;
+  int32 async_embedding_threads_num = 13;
+  int32 async_embedding_capacity = 14;
 }
 
 message GraphOptions {
@@ -370,6 +374,14 @@ message SessionMetadata {
 
   // The version is optional. If set, needs to be >= 0.
   int64 version = 2;
+}
+
+// config for cuda graph mode session
+message CudaGraphModeOptions {
+    repeated string output_names = 1;
+    int32 batch_size = 2;
+    bool allow_fallback = 3;
+    bool has_invalid_graph = 4;
 }
 
 // Session configuration parameters.
@@ -581,6 +593,7 @@ message ConfigProto {
   repeated string per_session_devices = 207;
 
   // Next: 208
+  CudaGraphModeOptions cuda_graph_mode_options = 208;
 }
 
 // Options for a single Run() call.

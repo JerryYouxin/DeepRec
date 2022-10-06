@@ -50,7 +50,7 @@ alideeprec/deeprec-build:deeprec-dev-cpu-py36-ubuntu18.04
 **GPU Platform**
 
 ```
-alideeprec/deeprec-build:deeprec-dev-gpu-py36-cu110-ubuntu18.04
+alideeprec/deeprec-build:deeprec-dev-gpu-py36-cu116-ubuntu18.04
 ```
 
 ### **How to Build**
@@ -89,13 +89,13 @@ $ pip3 install /tmp/tensorflow_pkg/tensorflow-1.15.5+${version}-cp36-cp36m-linux
 #### Image for CPU
 
 ```
-alideeprec/deeprec-release:deeprec2206-cpu-py36-ubuntu18.04
+alideeprec/deeprec-release:deeprec2208-cpu-py36-ubuntu18.04
 ```
 
-#### Image for GPU CUDA11.0
+#### Image for GPU CUDA11.6
 
 ```
-alideeprec/deeprec-release:deeprec2206-gpu-py36-cu110-ubuntu18.04
+alideeprec/deeprec-release:deeprec2208-gpu-py36-cu116-ubuntu18.04
 ```
 
 ***

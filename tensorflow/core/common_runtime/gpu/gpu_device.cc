@@ -320,12 +320,13 @@ BaseGPUDevice::BaseGPUDevice(const SessionOptions& options, const string& name,
                              const string& physical_device_desc,
                              Allocator* gpu_allocator, Allocator* cpu_allocator,
                              bool sync_every_op, int32 max_streams,
-                             const DeviceResourceMgrMap* dev_rmgr_map)
+                             const DeviceResourceMgrMap* dev_rmgr_map,
+                             const DeviceGlobalThreadPoolOptions& opt)
     : LocalDevice(options, Device::BuildDeviceAttributes(name, physical_name,
                                                          DEVICE_GPU,
                                                          memory_limit, locality,
                                                          physical_device_desc),
-                  dev_rmgr_map),
+                  dev_rmgr_map, opt),
       gpu_allocator_(gpu_allocator),
       cpu_allocator_(cpu_allocator),
       scoped_allocator_mgr_(new ScopedAllocatorMgr(name)),
@@ -502,6 +503,33 @@ Status BaseGPUDevice::Init(const SessionOptions& options) {
   }
 
   return Status::OK();
+}
+
+void BaseGPUDevice::SetSingleStreamMode() {
+  stream_group_backup_ = streams_.front();
+  single_stream_mode_group_.compute = stream_group_backup_->compute;
+#if TENSORFLOW_USE_ROCM
+  single_stream_mode_group_.nccl = stream_group_backup_->compute;
+#endif
+  single_stream_mode_group_.host_to_device = stream_group_backup_->compute;
+  single_stream_mode_group_.device_to_host = stream_group_backup_->compute;
+  for (int i = 0; i < stream_group_backup_->device_to_device.size(); ++i) {
+    single_stream_mode_group_.device_to_device.push_back(stream_group_backup_->compute);
+  }
+
+  streams_.front() = &single_stream_mode_group_;
+  for (auto ctx : device_contexts_) {
+    ctx->StreamUnification();
+  }
+  is_single_stream_mode_ = true;
+}
+
+void BaseGPUDevice::ResetStreamMode() {
+  streams_.front() = stream_group_backup_;
+  for (auto ctx : device_contexts_) {
+    ctx->ResetStreamUnification();
+  }
+  is_single_stream_mode_ = false;
 }
 
 bool BaseGPUDevice::RequiresRecordingAccessedTensors() const {
@@ -1037,13 +1065,15 @@ Status BaseGPUDeviceFactory::ListPhysicalDevices(std::vector<string>* devices) {
 Status BaseGPUDeviceFactory::CreateDevices(
     const SessionOptions& options, const string& name_prefix,
     std::vector<std::unique_ptr<Device>>* devices) {
-  return CreateDevices(options, name_prefix, devices, nullptr);
+  return CreateDevices(options, name_prefix, devices,
+                       nullptr, DeviceGlobalThreadPoolOptions());
 }
 
 Status BaseGPUDeviceFactory::CreateDevices(
     const SessionOptions& options, const string& name_prefix,
     std::vector<std::unique_ptr<Device>>* devices,
-    const DeviceResourceMgrMap* dev_rmgr_map) {
+    const DeviceResourceMgrMap* dev_rmgr_map,
+    const DeviceGlobalThreadPoolOptions& opt) {
   TF_RETURN_IF_ERROR(ValidateGPUMachineManager());
   se::Platform* gpu_manager = GPUMachineManager();
   if (gpu_manager == nullptr) {
@@ -1267,7 +1297,8 @@ Status BaseGPUDeviceFactory::CreateDevices(
                               tf_gpu_id.value());
     }
     TF_RETURN_IF_ERROR(CreateGPUDevice(options, name_prefix, tf_gpu_id,
-                                       bytes, it->second, devices, dev_rmgr_map));
+                                       bytes, it->second, devices,
+                                       dev_rmgr_map, opt));
   }
   return Status::OK();
 }
@@ -1299,7 +1330,8 @@ Status BaseGPUDeviceFactory::CreateGPUDevice(
     int64 memory_limit, const DeviceLocality& dev_locality,
     std::vector<std::unique_ptr<Device>>* devices) {
   return CreateGPUDevice(options, name_prefix, tf_gpu_id,
-                         memory_limit, dev_locality, devices, nullptr);
+                         memory_limit, dev_locality, devices,
+                         nullptr, DeviceGlobalThreadPoolOptions());
 }
 
 Status BaseGPUDeviceFactory::CreateGPUDevice(
@@ -1307,7 +1339,8 @@ Status BaseGPUDeviceFactory::CreateGPUDevice(
     TfGpuId tf_gpu_id, int64 memory_limit,
     const DeviceLocality& dev_locality,
     std::vector<std::unique_ptr<Device>>* devices,
-    const DeviceResourceMgrMap* dev_rmgr_map) {
+    const DeviceResourceMgrMap* dev_rmgr_map,
+    const DeviceGlobalThreadPoolOptions& opt) {
   CHECK_GE(tf_gpu_id.value(), 0);
   const string device_name =
       strings::StrCat(name_prefix, "/device:GPU:", tf_gpu_id.value());
@@ -1353,7 +1386,7 @@ Status BaseGPUDeviceFactory::CreateGPUDevice(
         options, device_name, physical_name, static_cast<Bytes>(bytes_limit),
         dev_locality, tf_gpu_id, GetShortDeviceDescription(platform_gpu_id, *desc),
         gpu_allocator, ProcessState::singleton()->GetCPUAllocator(numa_node),
-        dev_rmgr_map);
+        dev_rmgr_map, opt);
     gpu_device = std::move(tmp);
   } else {
     std::unique_ptr<BaseGPUDevice> tmp = CreateGPUDevice(

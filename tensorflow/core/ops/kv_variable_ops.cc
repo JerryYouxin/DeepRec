@@ -181,6 +181,13 @@ is_initialized: a scalar boolean which is true if the variable has been
 initialized.
 )doc");
 
+REGISTER_OP("KvResourceInitCacheStrategyOp")
+    .Input("resource: resource")
+    .Attr("cache_strategy: int = 1")
+    .Attr("Tkeys: {int64,int32,string}")
+    .Attr("dtype: {float32, double}")
+    .SetShapeFn([](InferenceContext* c){return Status::OK();});
+
 Status KvVariableShapeShapeFn(InferenceContext* c) {
   auto* handle_data = c->input_handle_shapes_and_types(0);
   if (handle_data == nullptr || handle_data->empty()) {
@@ -234,6 +241,7 @@ REGISTER_OP("KvResourceGatherV1")
     .Input("counts: counts_type")
     .Attr("validate_indices: bool = true")
     .Attr("is_use_default_value_tensor: bool = false")
+    .Attr("is_inference: bool = false")
     .Output("output: dtype")
     .Attr("dtype: type")
     .Attr("Tkeys: {int64,int32,string}")
@@ -284,6 +292,7 @@ REGISTER_OP("KvResourceGather")
     .Output("output: dtype")
     .Attr("dtype: type")
     .Attr("Tkeys: {int64,int32,string}")
+    .Attr("is_inference: bool = false")
     .SetShapeFn([](InferenceContext* c) {
       ShapeAndType handle_shape_and_type;
       TF_RETURN_IF_ERROR(
@@ -436,6 +445,25 @@ REGISTER_OP("KvResourceImportV2")
     .Attr("default_value_no_permission: float = .0")
     .Attr("record_freq: bool = false")
     .Attr("record_version: bool = false")
+    .Attr("reset_version: bool = false")
+    .SetShapeFn([](InferenceContext* c) {
+          ShapeHandle handle;
+          TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 0, &handle));
+          return Status::OK();
+     })
+    .Doc(R"doc()doc");
+
+REGISTER_OP("KvResourceImportV3")
+    .Input("prefix: string")
+    .Input("resource_self: resource")
+    .Input("tensor_names: string")
+    .Input("empty_key: Tkeys")
+    .Attr("shape: shape")
+    .Attr("partition_id: int = 0")
+    .Attr("partition_num: int = 1")
+    .Attr("Tkeys: {int64,int32}")
+    .Attr("dtype: type")
+    .Attr("reset_version: bool = false")
     .SetShapeFn([](InferenceContext* c) {
           ShapeHandle handle;
           TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 0, &handle));
@@ -522,5 +550,27 @@ Outputs a partial offset tensor of features.
 keys: Vector of all keys present in the table.
 partial_offset: Vector of partial offset used for restore.
 )doc");
+
+REGISTER_OP("EVGetFrequency")
+    .Input("resource_handle: resource")
+    .Input("ids: Tkeys")
+    .Output("output: int64")
+    .Attr("Tkeys: {int64, int32}")
+    .Attr("Tvalues: type")
+    .SetShapeFn([](InferenceContext* c) {
+      return Status::OK();
+    })
+    .Doc(R"doc()doc");
+
+REGISTER_OP("EVGetVersion")
+    .Input("resource_handle: resource")
+    .Input("ids: Tkeys")
+    .Output("output: int64")
+    .Attr("Tkeys: {int64, int32}")
+    .Attr("Tvalues: type")
+    .SetShapeFn([](InferenceContext* c) {
+      return Status::OK();
+    })
+    .Doc(R"doc()doc");
 
 }  // namespace tensorflow

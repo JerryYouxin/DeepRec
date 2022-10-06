@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/grappler/optimizers/remapper.h"
+#include "tensorflow/core/graph/mkl_layout_pass_lists.h"
 
 #include "absl/container/flat_hash_set.h"
 #include "tensorflow/core/framework/versions.pb.h"
@@ -265,6 +266,8 @@ bool IsGpuCompatibleDataType(const NodeDef* contraction,
   DataType dtype = GetDataTypeFromAttr(*contraction, type_attr);
   if (IsConv2D(*contraction)) {
     return dtype == DT_FLOAT;
+  } else if (IsMatMul(*contraction)) {
+    return dtype == DT_FLOAT || dtype == DT_HALF;
   } else {
     return false;
   }
@@ -277,10 +280,21 @@ bool IsCpuCompatibleDataFormat(const NodeDef* conv2d) {
   return data_format == "NHWC" || data_format == "NCHW";
 }
 
-bool IsGpuCompatibleDataFormat(const NodeDef* conv2d) {
-  DCHECK(IsConv2D(*conv2d)) << "Expected Conv2D op";
-  const string& data_format = conv2d->attr().at(kDataFormat).s();
-  return data_format == "NHWC" || data_format == "NCHW";
+bool BlasLtMatmulEnabled() {
+  static bool is_enabled = [] {
+    bool is_enabled = false;
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar(
+        "TF_USE_CUBLASLT", /*default_val=*/false, &is_enabled));
+    return is_enabled;
+  }();
+  return is_enabled;
+}
+
+bool IsGpuCompatibleDataFormat(const RemapperContext& ctx,
+                                   const NodeDef* conv2d) {
+    DCHECK(IsConv2D(*conv2d)) << "Expected Conv2D op";
+      const string& data_format = conv2d->attr().at(kDataFormat).s();
+        return data_format == "NHWC" || data_format == "NCHW";
 }
 
 bool IsCpuCompatibleConv2D(const NodeDef* conv2d) {
@@ -289,10 +303,17 @@ bool IsCpuCompatibleConv2D(const NodeDef* conv2d) {
          IsCpuCompatibleDataFormat(conv2d);
 }
 
-bool IsGpuCompatibleConv2D(const NodeDef* conv2d) {
-  DCHECK(IsConv2D(*conv2d)) << "Expected Conv2D op";
-  return NodeIsOnGpu(conv2d) && IsGpuCompatibleDataType(conv2d) &&
-         IsGpuCompatibleDataFormat(conv2d);
+bool IsGpuCompatibleConv2D(const RemapperContext& ctx, const NodeDef* conv2d) {
+    DCHECK(IsConv2D(*conv2d)) << "Expected Conv2D op";
+      return NodeIsOnGpu(conv2d) && IsGpuCompatibleDataType(conv2d) &&
+                 IsGpuCompatibleDataFormat(ctx, conv2d);
+}
+
+bool IsGpuCompatibleMatMul(const RemapperContext& ctx,
+    const NodeDef* matmul) {
+  DCHECK(IsMatMul(*matmul)) << "Expected MatMul op";
+  return BlasLtMatmulEnabled() && NodeIsOnGpu(matmul) &&
+         IsGpuCompatibleDataType(matmul);
 }
 
 bool IsCpuCompatibleMatMul(const NodeDef* matmul) {
@@ -327,37 +348,60 @@ bool IsCpuCompatible(const RemapperContext& ctx, const Pattern& matched) {
 // Checks if we can rewrite a pattern to the `_FusedConv2D` on GPU device.
 bool IsGpuCompatible(const RemapperContext& ctx,
                      const ContractionWithBiasAddAndActivation& matched) {
+#if TENSORFLOW_USE_ROCM
+  // ROCm does not support _FusedConv2D
+  return false;
+#endif
   // xla does not cluster _FusedConv2D, and knows how to do this optimization
   if (ctx.xla_on_) return false;
 
   const GraphDef* graph = ctx.graph_view.graph();
-  const NodeDef& contraction_node = graph->node(matched.contraction);
-  if (!IsConv2D(contraction_node)) return false;
-
-  const std::vector<OpInfo::TensorProperties>& input_props =
-      ctx.graph_properties.GetInputProperties(contraction_node.name());
-  const TensorShapeProto& filter_shape =
-      input_props.size() >= 2 ? input_props[1].shape() : TensorShapeProto();
-
-  // FusedConv2D on GPU with 1x1 convolution is marginally faster than
-  // in-graph computation in micro benchmarks (see kernels/conv_ops_test.cc),
-  // and significantly slower in large scale benchmarks.
-  bool is_spatial_conv = Rank(filter_shape) == 4 &&          //
-                         IsKnown(filter_shape.dim(1)) &&     //
-                         IsKnown(filter_shape.dim(2)) &&     //
-                         filter_shape.dim(1).size() != 1 &&  //
-                         filter_shape.dim(2).size() != 1;
-
-  // We rely on cuDNN for fused convolution, and it currently supports only Relu
-  // activation.
+  
+  // We rely on cuDNN for fused convolution and cublasLt for fused matmul.
   const NodeDef& activation_node = graph->node(matched.activation);
-  bool is_relu = IsRelu(activation_node);
+  if (!IsRelu(activation_node)) return false;
+  const NodeDef& contraction_node = graph->node(matched.contraction);
+  if (IsConv2D(contraction_node)) {
+    const std::vector<OpInfo::TensorProperties>& input_props =
+        ctx.graph_properties.GetInputProperties(contraction_node.name());
+    const TensorShapeProto& filter_shape =
+        input_props.size() >= 2 ? input_props[1].shape() : TensorShapeProto();
 
-  return is_relu && is_spatial_conv && IsGpuCompatibleConv2D(&contraction_node);
+    // FusedConv2D on GPU with 1x1 convolution is marginally faster than
+    // in-graph computation in micro benchmarks (see kernels/conv_ops_test.cc),
+    // and significantly slower in large scale benchmarks.
+    bool is_spatial_conv = Rank(filter_shape) == 4 &&          //
+                           IsKnown(filter_shape.dim(1)) &&     //
+                           IsKnown(filter_shape.dim(2)) &&     //
+                           filter_shape.dim(1).size() != 1 &&  //
+                           filter_shape.dim(2).size() != 1;
+
+    return is_spatial_conv && IsGpuCompatibleConv2D(ctx, &contraction_node);
+  } else if (IsMatMul(contraction_node)) {
+    return IsGpuCompatibleMatMul(ctx, &contraction_node);
+  }
+
+  return false;
 }
+
+// Checks if we can rewrite a pattern to the `_FusedMatMul` on GPU device.
 bool IsGpuCompatible(const RemapperContext& ctx,
                      const ContractionWithBiasAdd& matched) {
+#if TENSORFLOW_USE_ROCM
+  // ROCm does not support _FusedMatMul
   return false;
+#endif
+  // The TF->XLA bridge does not support `_FusedMatMul` so we avoid creating
+  // this op. Furthermore, XLA already does this fusion internally so there
+  // is no true benefit from doing this optimization if XLA is going to compile
+  // the unfused operations anyway.
+  if (ctx.xla_on_) return false;
+
+  const GraphDef* graph = ctx.graph_view.graph();
+  const NodeDef& contraction_node = graph->node(matched.contraction);
+  if (!IsMatMul(contraction_node)) return false;
+
+  return IsGpuCompatibleMatMul(ctx, &contraction_node);
 }
 bool IsGpuCompatible(const RemapperContext& ctx,
                      const ContractionWithSqueezeAndBiasAdd& matched) {
@@ -2087,7 +2131,8 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
 
       if (!item.optimization_options().is_eager_mode) {
         // Remap Conv2D+BiasAdd+Add+relu into the _FusedConv2D.
-        if (FindContractionWithBiasAndAddActivation(
+        if (MklLayoutPassLists::FindFusedMatMul() &&
+              FindContractionWithBiasAndAddActivation(
                 ctx, i, &contract_with_bias_and_add_activation)) {
           TF_RETURN_IF_ERROR(AddFusedContractionNode(
               &ctx, contract_with_bias_and_add_activation, &invalidated_nodes,
@@ -2095,8 +2140,9 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
           continue;
         }
 
-        // Remap Conv2D+BiasAdd+Add into the _FusedConv2D.
-        if (FindContractionWithBiasAddAndAdd(ctx, i,
+        // // Remap Conv2D+BiasAdd+Add into the _FusedConv2D.
+        if (MklLayoutPassLists::FindFusedMatMul() &&
+              FindContractionWithBiasAddAndAdd(ctx, i,
                                              &contract_with_bias_and_add)) {
           TF_RETURN_IF_ERROR(
               AddFusedContractionNode(&ctx, contract_with_bias_and_add,
@@ -2113,7 +2159,8 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
 
         // MatMul + BiasAdd + Gelu fusion
         std::map<string, int> node_label_to_index;
-        if (FindMatMulWithBiasAndAGelu(&ctx, i, &node_label_to_index,
+        if (MklLayoutPassLists::FindFusedMatMul() &&
+              FindMatMulWithBiasAndAGelu(&ctx, i, &node_label_to_index,
                                        &nodes_to_delete, true)) {
           TF_RETURN_IF_ERROR(AddFusedMatMulWithBiasAndGelu(
               &ctx, node_label_to_index, &invalidated_nodes, true));
@@ -2121,7 +2168,8 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
         };
 
         // MatMul + BiasAdd + Gelu_erf fusion
-        if (FindMatMulWithBiasAndAGelu(&ctx, i, &node_label_to_index,
+        if (MklLayoutPassLists::FindFusedMatMul() &&
+              FindMatMulWithBiasAndAGelu(&ctx, i, &node_label_to_index,
                                        &nodes_to_delete, false)) {
           TF_RETURN_IF_ERROR(AddFusedMatMulWithBiasAndGelu(
               &ctx, node_label_to_index, &invalidated_nodes, false));
