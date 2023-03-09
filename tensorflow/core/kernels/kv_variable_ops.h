@@ -20,7 +20,6 @@ limitations under the License.
 #include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/embedding/embedding_var.h"
 #include "tensorflow/core/framework/embedding/kv_interface.h"
-#include "tensorflow/core/framework/embedding/multilevel_embedding.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/resource_mgr.h"
@@ -33,19 +32,9 @@ limitations under the License.
 #include "tensorflow/core/lib/random/random.h"
 #include "tensorflow/core/lib/random/random_distributions.h"
 #include "tensorflow/core/util/tensor_bundle/tensor_bundle.h"
-#if GOOGLE_CUDA
-#define EIGEN_USE_GPU
-#if TENSORFLOW_USE_GPU_EV
-#include "tensorflow/core/kernels/kv_variable_ops_gpu.h"
-#endif // TENSORFLOW_USE_GPU_EV
-#endif  // GOOGLE_CUDA
 
 namespace tensorflow {
 using GPUDevice = Eigen::GpuDevice;
-
-namespace {
-  const int kSavedPartitionNum = 1000;
-}
 
 template<class T>
 class EVKeyDumpIterator: public  DumpIterator<T> {
@@ -178,26 +167,171 @@ Status GetInputEmbeddingVar(OpKernelContext* ctx, int input,
   }
 }
 
+template <class K>
+void DumpSsdIndexMeta(
+    SsdRecordDescriptor<K>& ssd_rec_desc,
+    const std::string& prefix,
+    const std::string& var_name) {
+  std::fstream fs;
+  std::string var_name_temp(var_name);
+  std::string new_str = "_";
+  int64 pos = var_name_temp.find("/");
+  while (pos != std::string::npos) {
+    var_name_temp.replace(pos, 1, new_str.data(), 1);
+    pos =var_name_temp.find("/");
+  }
+
+  std::string ssd_record_path =
+      prefix + "-" + var_name_temp + "-ssd_record";
+
+  BundleWriter ssd_record_writer(Env::Default(),
+                                 ssd_record_path);
+  typedef EVFreqDumpIterator<int64> Int64DataDumpIterator;
+  typedef EVFreqDumpIterator<uint8> StringDumpIterator;
+  size_t bytes_limit = 8 << 20;
+  char* dump_buffer = new char[bytes_limit];
+
+  int64 num_of_keys = ssd_rec_desc.key_list.size();
+  EVKeyDumpIterator<K> keys_iter(ssd_rec_desc.key_list);
+  SaveTensorWithFixedBuffer(
+      "keys",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &keys_iter,
+      TensorShape({num_of_keys}));
+
+  Int64DataDumpIterator key_file_id_iter(ssd_rec_desc.key_file_id_list);
+  SaveTensorWithFixedBuffer(
+      "keys_file_id",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &key_file_id_iter,
+      TensorShape({num_of_keys}));
+
+  Int64DataDumpIterator key_offset_iter(ssd_rec_desc.key_offset_list);
+  SaveTensorWithFixedBuffer(
+      "keys_offset",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &key_offset_iter,
+      TensorShape({num_of_keys}));
+
+  int64 num_of_files = ssd_rec_desc.file_list.size();
+  Int64DataDumpIterator files_iter(ssd_rec_desc.file_list);
+  SaveTensorWithFixedBuffer(
+      "files",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &files_iter,
+      TensorShape({num_of_files}));
+
+  Int64DataDumpIterator
+      invalid_record_count_iter(ssd_rec_desc.invalid_record_count_list);
+  SaveTensorWithFixedBuffer(
+      "invalid_record_count",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &invalid_record_count_iter,
+      TensorShape({num_of_files}));
+
+  Int64DataDumpIterator
+      record_count_iter(ssd_rec_desc.record_count_list);
+  SaveTensorWithFixedBuffer(
+      "record_count",
+      &ssd_record_writer, dump_buffer,
+      bytes_limit, &record_count_iter,
+      TensorShape({num_of_files}));
+
+  ssd_record_writer.Finish();
+  delete[] dump_buffer;
+}
+
+template<class K>
+void CopyEmbeddingfilesToCkptDir(
+    const SsdRecordDescriptor<K>& ssd_rec_desc,
+    const std::string& prefix,
+    const std::string& var_name) {
+  std::string var_name_temp(var_name);
+  std::string new_str = "_";
+  int64 pos = var_name_temp.find("/");
+  while (pos != std::string::npos) {
+    var_name_temp.replace(pos, 1, new_str.data(), 1);
+    pos =var_name_temp.find("/");
+  }
+
+  std::string embedding_folder_path =
+      prefix + "-" + var_name_temp + "-emb_files/";
+  Status s = Env::Default()->CreateDir(embedding_folder_path);
+  if (errors::IsAlreadyExists(s)) {
+    int64 undeleted_files, undeleted_dirs;
+    Env::Default()->
+        DeleteRecursively(embedding_folder_path,
+                          &undeleted_files,
+                          &undeleted_dirs);
+    Env::Default()->CreateDir(embedding_folder_path);
+  }
+
+  for (int64 i = 0; i < ssd_rec_desc.file_list.size(); i++) {
+    int64 file_id = ssd_rec_desc.file_list[i];
+    std::stringstream old_ss;
+    old_ss << std::setw(4) << std::setfill('0') << file_id << ".emb";
+    std::string file_path = ssd_rec_desc.file_prefix + old_ss.str();
+    std::string file_name = file_path.substr(file_path.rfind("/"));
+    std::stringstream new_ss;
+    new_ss << file_id << ".emb";
+    std::string new_file_path = embedding_folder_path + new_ss.str();
+    Status s = Env::Default()->CopyFile(file_path, new_file_path);
+    if (!s.ok()) {
+      LOG(FATAL)<<"Copy file "<<file_path<<" failed!";
+    }
+  }
+}
+
 template <class K, class V>
 Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
     const string& tensor_key, BundleWriter* writer,
-    Tensor* part_offset_tensor) {
+    Tensor* part_offset_tensor,
+    const std::string& prefix = "") {
   std::vector<K> tot_key_list;
-  std::vector<V* > tot_valueptr_list;
+  std::vector<V*> tot_valueptr_list;
   std::vector<int64> tot_version_list;
   std::vector<int64> tot_freq_list;
   std::vector<K> tot_key_filter_list;
   std::vector<int64> tot_freq_filter_list;
   std::vector<int64> tot_version_filter_list;
   embedding::Iterator* it = nullptr;
-  mutex_lock l(*ev->storage_manager()->get_mutex());
-  int64 total_size = ev->GetSnapshot(&tot_key_list,
-      &tot_valueptr_list, &tot_version_list, &tot_freq_list, &it);
-  VLOG(1) << "EV:" << tensor_key << ", save size:" << total_size;
+  int64 num_of_keys = 0;
+  //For the time being, only ev which uses SSD for storage,
+  //ev->IsUsePersistentStorage() will get true.
+  if (ev->IsUsePersistentStorage()) {
+    SsdRecordDescriptor<K> ssd_rec_desc;
+    num_of_keys =
+        ev->GetSnapshotWithoutFetchPersistentEmb(
+            &tot_key_list,
+            &tot_valueptr_list,
+            &tot_version_list,
+            &tot_freq_list,
+            &ssd_rec_desc);
+    bool is_primary = (ev->GetEmbeddingIndex() == 0);
+    if (is_primary) {
+      DumpSsdIndexMeta(ssd_rec_desc, prefix, tensor_key);
+      CopyEmbeddingfilesToCkptDir(ssd_rec_desc, prefix, tensor_key);
+    }
+  } else {
+    num_of_keys = ev->GetSnapshot(
+        &tot_key_list,
+        &tot_valueptr_list,
+        &tot_version_list,
+        &tot_freq_list, &it);
+  }
+
+  VLOG(1) << "EV:" << tensor_key << ", save size:" << num_of_keys;
   int64 iterator_size = 0;
+  int64 filter_iterator_size = 0;
   if (it != nullptr) {
+    it->SwitchToAdmitFeatures();
+    ev->storage_manager()->iterator_mutex_lock();
     for (it->SeekToFirst(); it->Valid(); it->Next()) {
       ++iterator_size;
+    }
+    it->SwitchToFilteredFeatures();
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      ++filter_iterator_size;
     }
   }
 
@@ -232,6 +366,9 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
 
   // save the ev with kSavedPartitionNum piece of tensor
   // so that we can dynamically load ev with changed partition number
+  bool save_unfiltered_features;
+  TF_CHECK_OK(ReadBoolFromEnvVar(
+      "TF_EV_SAVE_FILTERED_FEATURES", true, &save_unfiltered_features));
   int64 filter_freq = ev->MinFreq();
   for (size_t i = 0; i < tot_key_list.size(); i++) {
     for (int partid = 0; partid < kSavedPartitionNum; partid++) {
@@ -239,7 +376,15 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
         if (tot_valueptr_list[i] == reinterpret_cast<V*>(-1)) {
             // only forward, no backward, bypass
         } else if (tot_valueptr_list[i] == nullptr) {
-          key_filter_list_parts[partid].push_back(tot_key_list[i]);
+          if (filter_freq) {
+            if (save_unfiltered_features) {
+              key_filter_list_parts[partid].push_back(tot_key_list[i]);
+            }
+          } else {
+            key_list_parts[partid].push_back(tot_key_list[i]);
+            valueptr_list_parts[partid].push_back(
+                ev->GetDefaultValue(tot_key_list[i]));
+          }
         } else {
           key_list_parts[partid].push_back(tot_key_list[i]);
           valueptr_list_parts[partid].push_back(tot_valueptr_list[i]);
@@ -253,7 +398,9 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
     for (int partid = 0; partid < kSavedPartitionNum; partid++) {
       if (tot_key_list[i] % kSavedPartitionNum == partid) {
         if (tot_valueptr_list[i] == nullptr) {
-          version_filter_list_parts[partid].push_back(tot_version_list[i]);
+          if (save_unfiltered_features) {
+            version_filter_list_parts[partid].push_back(tot_version_list[i]);
+          }
         } else {
           version_list_parts[partid].push_back(tot_version_list[i]);
         }
@@ -266,7 +413,9 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
     for (int partid = 0; partid < kSavedPartitionNum; partid++) {
       if (tot_key_list[i] % kSavedPartitionNum == partid) {
         if (tot_valueptr_list[i] == nullptr) {
-          freq_filter_list_parts[partid].push_back(tot_freq_list[i]);
+          if (save_unfiltered_features) {
+            freq_filter_list_parts[partid].push_back(tot_freq_list[i]);
+          }
         } else {
           freq_list_parts[partid].push_back(tot_freq_list[i]);
         }
@@ -315,9 +464,15 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
     part_filter_offset[partid + 1] = part_filter_offset[partid] + key_filter_list.size();
   }
   // TODO: DB iterator not support partition_offset
+  if (it != nullptr) {
+    it->SetPartOffset((int32*)part_offset_tensor->data());
+  }
   writer->Add(tensor_key + "-partition_offset", *part_offset_tensor);
   for(int i = 0; i <  kSavedPartitionNum + 1; i++) {
     part_offset_flat(i) = part_filter_offset[i];
+  }
+  if (it != nullptr) {
+    it->SetPartFilterOffset((int32*)part_offset_tensor->data());
   }
   writer->Add(tensor_key + "-partition_filter_offset", *part_offset_tensor);
 
@@ -330,7 +485,9 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
   size_t bytes_limit = 8 << 20;
   char* dump_buffer = (char*)malloc(sizeof(char) * bytes_limit);
   Status st;
-
+  if (it != nullptr) {
+    it->SwitchToAdmitFeatures();
+  }
   EVKeyDumpIterator<K> ev_key_dump_iter(partitioned_tot_key_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-keys", writer, dump_buffer,
                                  bytes_limit, &ev_key_dump_iter,
@@ -354,7 +511,8 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
   EVVersionDumpIterator<int64> ev_version_dump_iter(partitioned_tot_version_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-versions", writer, dump_buffer,
       bytes_limit, &ev_version_dump_iter,
-      TensorShape({partitioned_tot_version_list.size()}));
+      TensorShape({partitioned_tot_version_list.size() + iterator_size}),
+      it, -3);
   if (!st.ok()) {
     free(dump_buffer);
     return st;
@@ -363,16 +521,20 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
   EVFreqDumpIterator<int64> ev_freq_dump_iter(partitioned_tot_freq_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-freqs", writer, dump_buffer,
       bytes_limit, &ev_freq_dump_iter,
-      TensorShape({partitioned_tot_freq_list.size()}));
+      TensorShape({partitioned_tot_freq_list.size() + iterator_size}),
+      it, -2);
   if (!st.ok()) {
     free(dump_buffer);
     return st;
   }
-
+  if (it != nullptr) {
+    it->SwitchToFilteredFeatures();
+  }
   EVKeyDumpIterator<K> ev_key_filter_dump_iter(partitioned_tot_key_filter_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-keys_filtered",
       writer, dump_buffer, bytes_limit, &ev_key_filter_dump_iter,
-      TensorShape({partitioned_tot_key_filter_list.size()}));
+      TensorShape({partitioned_tot_key_filter_list.size()
+          + filter_iterator_size}), it);
   if (!st.ok()) {
     free(dump_buffer);
     return st;
@@ -382,7 +544,8 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
       partitioned_tot_version_filter_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-versions_filtered",
       writer, dump_buffer, bytes_limit, &ev_version_filter_dump_iter,
-      TensorShape({partitioned_tot_version_filter_list.size()}));
+      TensorShape({partitioned_tot_version_filter_list.size()
+          + filter_iterator_size}), it, -3);
   if (!st.ok()) {
     free(dump_buffer);
     return st;
@@ -392,7 +555,8 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
       partitioned_tot_freq_filter_list);
   st = SaveTensorWithFixedBuffer(tensor_key + "-freqs_filtered",
       writer, dump_buffer, bytes_limit, &ev_freq_filter_dump_iter,
-      TensorShape({partitioned_tot_freq_filter_list.size()}));
+      TensorShape({partitioned_tot_freq_filter_list.size()
+          + filter_iterator_size}), it, -2);
   if (!st.ok()) {
     free(dump_buffer);
     return st;
@@ -401,7 +565,14 @@ Status DumpEmbeddingValues(EmbeddingVar<K, V>* ev,
   free(dump_buffer);
 
   if (it != nullptr) {
+    ev->storage_manager()->iterator_mutex_unlock();
     delete it;
+  }
+
+  if (ev->IsSingleHbm()) {
+    TypedAllocator::Deallocate(
+        cpu_allocator(), tot_valueptr_list[0],
+        partitioned_tot_freq_list.size() * ev->ValueLen());
   }
   return Status::OK();
 }
@@ -412,11 +583,16 @@ const static string part_str = "part_";
 
 template<typename K, typename V>
 Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
-    std::string name_string, int orig_partnum,
+    std::string name_string, int orig_partnum, const GPUDevice* device,
     int64 partition_id = 0, int64 partition_num = 1, bool reset_version = false) {
   string curr_partid_str = std::to_string(partition_id);
   bool filter_flag = true;
-  bool restore_filter_flag = true;
+  embedding::BatchCache<K>* cache_for_restore_hbm = nullptr;
+  if (ev->IsMultiLevel() && ev->IsUseHbm()) {
+    auto cache_strategy = ev->storage_manager()->CacheStrategy();
+    cache_for_restore_hbm = embedding::CacheFactory::Create<K>(
+        cache_strategy, "hbm_restore_cache for " + name_string);
+  }
   for (int i = 0; i < orig_partnum; i++) {
     string part_id = std::to_string(i);
     string pre_subname =
@@ -441,9 +617,11 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
     if (!st.ok()) {
       return st;
     }
-    st = reader->LookupTensorShape(tensor_version, &version_shape);
-    if (!st.ok()) {
-      return st;
+    if (!reset_version) {
+      st = reader->LookupTensorShape(tensor_version, &version_shape);
+      if (!st.ok()) {
+        return st;
+      }
     }
 
     st = reader->LookupTensorShape(tensor_freq, &freq_shape);
@@ -455,7 +633,7 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
       }
     }
 
-    reader->LookupHeader(tensor_key, sizeof(K) * key_shape.dim_size(0));
+    st = reader->LookupHeader(tensor_key, sizeof(K) * key_shape.dim_size(0));
     if (!st.ok()) {
       return st;
     }
@@ -464,10 +642,12 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
     if (!st.ok()) {
       return st;
     }
-    st = reader->LookupHeader(tensor_version,
-        sizeof(int64) * version_shape.dim_size(0));
-    if (!st.ok()) {
-      return st;
+    if (!reset_version) {
+      st = reader->LookupHeader(tensor_version,
+          sizeof(int64) * version_shape.dim_size(0));
+      if (!st.ok()) {
+        return st;
+      }
     }
     st = reader->LookupHeader(tensor_freq,
         sizeof(int64) * freq_shape.dim_size(0));
@@ -485,7 +665,12 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
     restore_buff.value_buffer = new char[buffer_size];
     restore_buff.version_buffer = new char[buffer_size];
     restore_buff.freq_buffer = new char[buffer_size];
-
+    int64 newDim = ev->ValueLen();
+    size_t value_unit_bytes_new = sizeof(V) * newDim;
+    int64 idx = 0;
+    bool restore_customDim;
+    TF_CHECK_OK(ReadBoolFromEnvVar(
+                                  "TF_EV_RESTORE_CUSTOM_DIM", false, &restore_customDim));
     size_t key_bytes_read = 0;
     size_t value_bytes_read = 0;
     size_t version_bytes_read = 0;
@@ -496,6 +681,7 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
     while(tot_key_num > 0) {
       size_t read_key_num = std::min(std::min(buffer_size / sizeof(K),
             buffer_size / value_unit_bytes), buffer_size / sizeof(int64));
+      read_key_num = std::min(read_key_num, buffer_size / value_unit_bytes_new);
       read_key_num = std::min((int64)read_key_num, tot_key_num);
       reader->LookupSegment(tensor_key, read_key_num * sizeof(K),
           restore_buff.key_buffer, key_bytes_read);
@@ -530,8 +716,40 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
       if (key_bytes_read > 0) {
         read_key_num = key_bytes_read / sizeof(K);
         VLOG(2) << "repartition, read_key_num:" << read_key_num;
+        if (restore_customDim && value_shape.dim_size(1) != newDim) {
+          VLOG(2) << "restore, read_value_reshape dim: from "
+                  << value_shape.dim_size(1) << " to " << newDim;
+          if (read_key_num * value_unit_bytes != value_bytes_read) {
+            return tensorflow::errors::FailedPrecondition(
+                "Expected read_key_num * value_unit_bytes == value_bytes_read, "
+                "but got read_key_num * value_unit_bytes != value_bytes_read!");
+          }
+
+	  std::unique_ptr<char[]> tmp_ptr(new char[buffer_size]);
+          size_t read_once = std::min(value_unit_bytes, value_unit_bytes_new);
+          for (int i = 0; i < read_key_num; ++i) {
+            memcpy(tmp_ptr.get() + i * value_unit_bytes_new,
+                   restore_buff.value_buffer + i * value_unit_bytes, read_once);
+            if (value_shape.dim_size(1) >= newDim) continue;
+            auto p = ev->GetDefaultValue(idx);
+            ++idx;
+            memcpy(tmp_ptr.get() + i * value_unit_bytes_new +
+                       value_unit_bytes,
+                   p + value_unit_bytes,
+                   value_unit_bytes_new - value_unit_bytes);
+          }
+          auto tmp = tmp_ptr.release();
+          tmp_ptr.reset(restore_buff.value_buffer);
+          restore_buff.value_buffer = tmp;
+        }
         st = ev->Import(restore_buff, read_key_num, kSavedPartitionNum,
-            partition_id, partition_num, false);
+            partition_id, partition_num, false, device);
+        if (cache_for_restore_hbm) {
+          cache_for_restore_hbm->add_to_rank(
+              (K*)restore_buff.key_buffer, read_key_num,
+              (int64*)restore_buff.version_buffer,
+              (int64*)restore_buff.freq_buffer);
+        }
         if (!st.ok()) {
           return st;
         }
@@ -539,13 +757,34 @@ Status DynamicRestoreValue(EmbeddingVar<K, V>* ev, BundleReader* reader,
       }
     }
   }
+  if (cache_for_restore_hbm) {
+    int64 cache_capacity = ev->CacheSize();
+    int64 num_of_hbm_ids =
+        std::min(cache_capacity, (int64)cache_for_restore_hbm->size());
+    K* hbm_ids = new K[num_of_hbm_ids];
+    int64* hbm_freqs = new int64[num_of_hbm_ids];
+    int64* hbm_versions = nullptr;
+    cache_for_restore_hbm->get_cached_ids(
+        hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+    ev->ImportToHbm(hbm_ids, num_of_hbm_ids);
+    ev->storage_manager()->Schedule([ev, hbm_ids, num_of_hbm_ids,
+                                     hbm_versions, hbm_freqs]() {
+      embedding::BatchCache<K>* cache = ev->Cache();
+      cache->add_to_rank(hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+      delete[] hbm_ids;
+      delete[] hbm_freqs;
+    });
+    delete cache_for_restore_hbm;
+  }
   return Status::OK();
 }
 
 template<typename K, typename V>
 Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
     std::string tensor_key, std::string tensor_value,
-    std::string tensor_version, std::string tensor_freq, bool reset_version=false) {
+    std::string tensor_version, std::string tensor_freq,
+    const GPUDevice* device,
+    bool reset_version=false) {
   TensorShape key_shape;
   TensorShape value_shape;
   TensorShape version_shape;
@@ -635,6 +874,12 @@ Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
   if (!st.ok() && st.code() != error::NOT_FOUND){
     return st;
   }
+  embedding::BatchCache<K>* cache_for_restore_hbm = nullptr;
+  if (ev->IsMultiLevel() && ev->IsUseHbm()) {
+    auto cache_strategy = ev->storage_manager()->CacheStrategy();
+    cache_for_restore_hbm = embedding::CacheFactory::Create<K>(
+        cache_strategy, "hbm_restore_cache for " + tensor_key);
+  }
 
   size_t buffer_size = 8 << 20;
   RestoreBuffer restore_buff;
@@ -642,7 +887,12 @@ Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
   restore_buff.value_buffer = new char[buffer_size];
   restore_buff.version_buffer = new char[buffer_size];
   restore_buff.freq_buffer = new char[buffer_size];
-
+  int64 newDim = ev->ValueLen();
+  size_t value_unit_bytes_new = sizeof(V) * newDim;
+  int64 idx = 0;
+  bool restore_customDim;
+  TF_CHECK_OK(ReadBoolFromEnvVar(
+                                "TF_EV_RESTORE_CUSTOM_DIM", false, &restore_customDim));
   size_t key_bytes_read = 0;
   size_t value_bytes_read = 0;
   size_t version_bytes_read = 0;
@@ -658,6 +908,7 @@ Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
     size_t read_key_num = std::min(
         std::min(buffer_size / sizeof(K),
           buffer_size / value_unit_bytes), buffer_size / sizeof(int64));
+    read_key_num = std::min(read_key_num, buffer_size / value_unit_bytes_new);
     read_key_num = std::min((int64)read_key_num, tot_key_num);
     reader->LookupSegment(tensor_key, read_key_num * sizeof(K),
         restore_buff.key_buffer, key_bytes_read);
@@ -692,7 +943,38 @@ Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
       read_key_num = key_bytes_read / sizeof(K);
       VLOG(2) << "restore, read_key_num:" << read_key_num;
 
-      st = ev->Import(restore_buff, read_key_num, 1, 0, 1, false);
+      if (restore_customDim && value_shape.dim_size(1) != newDim) {
+        VLOG(2) << "restore, read_value_reshape dim: from "
+                << value_shape.dim_size(1) << " to " << newDim;
+        if (read_key_num * value_unit_bytes != value_bytes_read) {
+          return tensorflow::errors::FailedPrecondition(
+              "Expected read_key_num * value_unit_bytes == value_bytes_read, "
+              "but got read_key_num * value_unit_bytes != value_bytes_read!");
+        }
+
+        std::unique_ptr<char[]> tmp_ptr(new char[buffer_size]);
+        size_t read_once = std::min(value_unit_bytes, value_unit_bytes_new);
+        for (int i = 0; i < read_key_num; ++i) {
+          memcpy(tmp_ptr.get() + i * value_unit_bytes_new,
+                 restore_buff.value_buffer + i * value_unit_bytes, read_once);
+          if (value_shape.dim_size(1) >= newDim) continue;
+          auto p = ev->GetDefaultValue(idx);
+          ++idx;
+          memcpy(tmp_ptr.get() + i * value_unit_bytes_new +
+                     value_unit_bytes,
+                 p + value_unit_bytes, value_unit_bytes_new - value_unit_bytes);
+        }
+        auto tmp = tmp_ptr.release();
+        tmp_ptr.reset(restore_buff.value_buffer);
+        restore_buff.value_buffer = tmp;
+      }
+      st = ev->Import(restore_buff, read_key_num, 1, 0, 1, false, device);
+      if (cache_for_restore_hbm) {
+        cache_for_restore_hbm->add_to_rank(
+            (K*)restore_buff.key_buffer, read_key_num,
+            (int64*)restore_buff.version_buffer,
+            (int64*)restore_buff.freq_buffer);
+      }
       if (!st.ok())
         return st;
       tot_key_num -= read_key_num;
@@ -723,14 +1005,40 @@ Status EVRestoreNoPartition(EmbeddingVar<K, V>* ev, BundleReader* reader,
         read_key_num = key_filter_bytes_read / sizeof(K);
         VLOG(2) << "restore, read_key_num:" << read_key_num;
 
-        st = ev->Import(restore_buff, read_key_num, 1, 0, 1, true);
+        st = ev->Import(restore_buff, read_key_num, 1, 0, 1, true, device);
+        if (cache_for_restore_hbm) {
+          cache_for_restore_hbm->add_to_rank(
+              (K*)restore_buff.key_buffer, read_key_num,
+              (int64*)restore_buff.version_buffer,
+              (int64*)restore_buff.freq_buffer);
+        }
         if (!st.ok())
           return st;
         tot_key_filter_num -= read_key_num;
       }
     }
   }
-  
+
+  if (cache_for_restore_hbm) {
+    int64 cache_capacity = ev->CacheSize();
+    int64 num_of_hbm_ids =
+        std::min(cache_capacity, (int64)cache_for_restore_hbm->size());
+    K* hbm_ids = new K[num_of_hbm_ids];
+    int64* hbm_freqs = new int64[num_of_hbm_ids];
+    int64* hbm_versions = nullptr;
+    cache_for_restore_hbm->get_cached_ids(
+        hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+    ev->ImportToHbm(hbm_ids, num_of_hbm_ids);
+    ev->storage_manager()->Schedule([ev, hbm_ids, num_of_hbm_ids,
+                                     hbm_versions, hbm_freqs]() {
+      embedding::BatchCache<K>* cache = ev->Cache();
+      cache->add_to_rank(hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+      delete[] hbm_ids;
+      delete[] hbm_freqs;
+    });
+    delete cache_for_restore_hbm;
+  }
+
   return Status::OK();
 }
 
@@ -762,7 +1070,8 @@ template<typename K, typename V>
 Status EVRestoreOldFromCheckpoint(EmbeddingVar<K, V>* ev,
     const std::string& name_string, const std::string& curr_partid_str,
     const std::string& key_suffix, int partition_id,
-    BundleReader* reader, int partition_num, bool reset_version=false) {
+    BundleReader* reader, int partition_num,
+    const GPUDevice* device, bool reset_version=false) {
   // first get original partition number
   int orig_partnum = 0;
   for (;  ; orig_partnum++) {
@@ -785,7 +1094,7 @@ Status EVRestoreOldFromCheckpoint(EmbeddingVar<K, V>* ev,
           << ", old partition_num:" << orig_partnum
           << ", new partition num:" << partition_num;
   Status s = DynamicRestoreValue(ev, reader, name_string,
-      orig_partnum, partition_id, partition_num, reset_version);
+      orig_partnum, device, partition_id, partition_num, reset_version);
   if (!s.ok()) {
     LOG(FATAL) <<  "EV restoring fail:" << s.ToString();
   }
@@ -799,14 +1108,14 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
     BundleReader* reader, const std::string& part_offset_tensor_suffix,
     const std::string& key_suffix, const std::string& value_suffix,
     const std::string& version_suffix, const std::string& freq_suffix,
-    bool reset_version = false) {
+    bool reset_version = false, const Eigen::GpuDevice* device = nullptr) {
 
   // first check whether there is partition
   if (name_string.find(part_str) == std::string::npos) {
     Status s = EVRestoreNoPartition(
         ev, reader, name_string + key_suffix,
         name_string + value_suffix, name_string + version_suffix,
-        name_string + freq_suffix, reset_version);
+        name_string + freq_suffix, device, reset_version);
     if (!s.ok()) {
       LOG(FATAL) <<  "EV restoring fail:" << s.ToString();
     }
@@ -819,7 +1128,7 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
 
   if (is_oldform) {
     EVRestoreOldFromCheckpoint(ev, name_string, curr_partid_str, key_suffix,
-        partition_id, reader, partition_num, reset_version);
+        partition_id, reader, partition_num, device, reset_version);
   } else {
     // first find out which sub parts we should load
     bool filter_flag = true;
@@ -837,6 +1146,13 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
             << ", partition_id:" << partition_id
             << ", partition_num:" << partition_num;
 
+    embedding::BatchCache<K>* cache_for_restore_hbm = nullptr;
+    if (ev->IsMultiLevel() && ev->IsUseHbm()) {
+      auto cache_strategy = ev->storage_manager()->CacheStrategy();
+      cache_for_restore_hbm = embedding::CacheFactory::Create<K>(
+          cache_strategy, "hbm_restore_cache for " + name_string);
+    }
+
     int orig_partnum = 0;
     size_t buffer_size = 8 << 20;
     RestoreBuffer restore_buff;
@@ -844,7 +1160,12 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
     restore_buff.value_buffer = new char[buffer_size];
     restore_buff.version_buffer = new char[buffer_size];
     restore_buff.freq_buffer = new char[buffer_size];
-
+    int64 newDim = ev->ValueLen();
+    size_t value_unit_bytes_new = sizeof(V) * newDim;
+    int64 idx = 0;
+    bool restore_customDim;
+    TF_CHECK_OK(ReadBoolFromEnvVar(
+			          "TF_EV_RESTORE_CUSTOM_DIM", false, &restore_customDim));
     for (;  ; orig_partnum++) {
       string part_id = std::to_string(orig_partnum);
       string pre_subname = name_string.substr(0, name_string.find(part_str));
@@ -967,15 +1288,13 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
       if (!st.ok()) {
         LOG(FATAL) <<  "EV restoring fail:" << st.ToString();
       }
-      Tensor part_offset_tensor;
-      st = context->allocate_temp(part_offset_type,
-          part_offset_shape, &part_offset_tensor);
+      Tensor part_offset_tensor(cpu_allocator(),
+          part_offset_type, part_offset_shape);
       if (!st.ok()) {
         LOG(FATAL) <<  "EV restoring fail:" << st.ToString();
       }
-      Tensor part_filter_offset_tensor;
-      st = context->allocate_temp(part_filter_offset_type,
-          part_filter_offset_shape, &part_filter_offset_tensor);
+      Tensor part_filter_offset_tensor(cpu_allocator(),
+          part_offset_type, part_offset_shape);
       if (!st.ok()) {
         LOG(FATAL) <<  "EV restoring fail:" << st.ToString();
       }
@@ -1019,6 +1338,7 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
         while(tot_key_num > 0) {
           size_t read_key_num = std::min(std::min(buffer_size / sizeof(K),
                 buffer_size / value_unit_bytes), buffer_size / sizeof(int64));
+          read_key_num = std::min(read_key_num, buffer_size / value_unit_bytes_new);
           read_key_num = std::min((int64)read_key_num, tot_key_num);
           reader->LookupSegmentOffset(tensor_key,
               key_part_offset + tot_key_bytes_read, read_key_num * sizeof(K),
@@ -1060,8 +1380,44 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
           if (key_bytes_read > 0) {
             read_key_num = key_bytes_read / sizeof(K);
             VLOG(2) << "restore, read_key_num:" << read_key_num;
+            if (restore_customDim && value_shape.dim_size(1) != newDim) {
+              VLOG(2) << "restore, read_value_reshape dim: from "
+                      << value_shape.dim_size(1) << " to " << newDim;
+              if (read_key_num * value_unit_bytes != value_bytes_read) {
+                return tensorflow::errors::FailedPrecondition(
+                    "Expected read_key_num * value_unit_bytes == "
+                    "value_bytes_read, but got read_key_num * value_unit_bytes "
+                    "!= value_bytes_read!");
+              }
+
+	      std::unique_ptr<char[]> tmp_ptr(new char[buffer_size]);
+              size_t read_once =
+                  std::min(value_unit_bytes, value_unit_bytes_new);
+              for (int i = 0; i < read_key_num; ++i) {
+                memcpy(tmp_ptr.get() + i * value_unit_bytes_new,
+                       restore_buff.value_buffer + i * value_unit_bytes,
+                       read_once);
+                if (value_shape.dim_size(1) >= newDim) continue;
+                auto p = ev->GetDefaultValue(idx);
+                ++idx;
+                memcpy(tmp_ptr.get() + i * value_unit_bytes_new +
+                           value_unit_bytes,
+                       p + value_unit_bytes,
+                       value_unit_bytes_new - value_unit_bytes);
+              }
+              auto tmp = tmp_ptr.release();
+              tmp_ptr.reset(restore_buff.value_buffer);
+              restore_buff.value_buffer = tmp;
+            }
+
             st = ev->Import(restore_buff, read_key_num, kSavedPartitionNum,
-                partition_id, partition_num, false);
+                partition_id, partition_num, false, device);
+            if (cache_for_restore_hbm) {
+              cache_for_restore_hbm->add_to_rank(
+                  (K*)restore_buff.key_buffer, read_key_num,
+                  (int64*)restore_buff.version_buffer,
+                  (int64*)restore_buff.freq_buffer);
+            }
             if (!st.ok()) {
               LOG(FATAL) <<  "EV restoring fail:" << st.ToString();
             }
@@ -1080,8 +1436,6 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
           int64 freq_filter_part_offset = subpart_filter_offset * sizeof(int64);
           int64 tot_key_filter_num =
             part_filter_offset_flat(subpart_id + 1) - subpart_filter_offset;
-          int64 tot_key_filter_bytes_read(0), tot_version_filter_bytes_read(0),
-                tot_freq_filter_bytes_read(0);
           size_t key_filter_bytes_read = 0;
           size_t version_filter_bytes_read = 0;
           size_t freq_filter_bytes_read = 0;
@@ -1110,7 +1464,13 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
               read_key_num = key_filter_bytes_read / sizeof(K);
               VLOG(2) << "restore, read_key_num:" << read_key_num;
               st = ev->Import(restore_buff, read_key_num, kSavedPartitionNum,
-                  partition_id, partition_num, true);
+                  partition_id, partition_num, true, device);
+              if (cache_for_restore_hbm) {
+                cache_for_restore_hbm->add_to_rank(
+                    (K*)restore_buff.key_buffer, read_key_num,
+                    (int64*)restore_buff.version_buffer,
+                    (int64*)restore_buff.freq_buffer);
+              }
               if (!st.ok())
                return st;
               tot_key_filter_num -= read_key_num;
@@ -1119,217 +1479,142 @@ Status EVRestoreDynamically(EmbeddingVar<K, V>* ev,
         }
       }
     }
+
+    if (cache_for_restore_hbm) {
+      int64 cache_capacity = ev->CacheSize();
+      int64 num_of_hbm_ids =
+          std::min(cache_capacity, (int64)cache_for_restore_hbm->size());
+      K* hbm_ids = new K[num_of_hbm_ids];
+      int64* hbm_freqs = new int64[num_of_hbm_ids];
+      int64* hbm_versions = nullptr;
+      cache_for_restore_hbm->get_cached_ids(
+          hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+      ev->ImportToHbm(hbm_ids, num_of_hbm_ids);
+      ev->storage_manager()->Schedule([ev, hbm_ids, num_of_hbm_ids,
+                                       hbm_versions, hbm_freqs]() {
+        embedding::BatchCache<K>* cache = ev->Cache();
+        cache->add_to_rank(hbm_ids, num_of_hbm_ids, hbm_versions, hbm_freqs);
+        delete[] hbm_ids;
+        delete[] hbm_freqs;
+      });
+      delete cache_for_restore_hbm;
+    }
   }
   return Status::OK();
 }
-#if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
-template<typename K, typename V>
-Status EVRestoreNoPartitionGPU(EmbeddingVarGPU<K, V>* ev, BundleReader* reader,
-    std::string tensor_key, std::string tensor_value, OpKernelContext* context,
-    std::string tensor_version, std::string tensor_freq) {
-  TensorShape key_shape;
-  TensorShape value_shape;
 
+
+template<class K>
+int64 ReadRecord(
+    BundleReader* reader,
+    const string& record_key,
+    K** buffer) {
+  TensorShape shape;
   Status st;
-  reader->LookupTensorShape(tensor_key, &key_shape);
-  reader->LookupTensorShape(tensor_value, &value_shape);
-  const cudaStream_t& stream = context->eigen_device<GPUDevice>().stream();
-  bool filter_flag = true;
-  bool restore_filter_flag = true;
-  st = reader->LookupHeader(tensor_key,
-      sizeof(K) * key_shape.dim_size(0));
-  if (!st.ok())
-    return st;
-  st = reader->LookupHeader(tensor_value,
-      sizeof(V) * value_shape.dim_size(0) * value_shape.dim_size(1));
-  if (!st.ok())
-    return st;
-
-  size_t buffer_size = 8 << 20;
-  RestoreBuffer restore_buff;
-  restore_buff.key_buffer = new char[buffer_size];
-  restore_buff.value_buffer = new char[buffer_size];
-
-  size_t key_bytes_read = 0;
-  size_t value_bytes_read = 0;
-
-  int64 tot_key_num = key_shape.dim_size(0);
-  size_t value_unit_bytes = sizeof(V) *  value_shape.dim_size(1);
-  std::string key_str = "|";
-  while(tot_key_num > 0) {
-    size_t read_key_num = std::min(
-        std::min(buffer_size / sizeof(K),
-          buffer_size / value_unit_bytes), buffer_size / sizeof(int64));
-    read_key_num = std::min((int64)read_key_num, tot_key_num);
-    reader->LookupSegment(tensor_key, read_key_num * sizeof(K),
-        restore_buff.key_buffer, key_bytes_read);
-    reader->LookupSegment(tensor_value, read_key_num * value_unit_bytes,
-        restore_buff.value_buffer, value_bytes_read);
-
-    if (key_bytes_read > 0) {
-      read_key_num = key_bytes_read / sizeof(K);
-      VLOG(2) << "restore, read_key_num:" << read_key_num;
-
-      st = ev->Import(restore_buff, read_key_num, 1, 0, 1, false, stream);
-      if (!st.ok())
-        return st;
-      tot_key_num -= read_key_num;
-    }
+  reader->LookupTensorShape(record_key, &shape);
+  st = reader->LookupHeader(record_key,
+      sizeof(K) * shape.dim_size(0));
+  if (!st.ok()) {
+    LOG(FATAL)<<"Restore record "<<record_key<<" failed";
   }
-  
-  return Status::OK();
+  size_t bytes_read = 0;
+  *buffer = new K[shape.dim_size(0)];
+  reader->LookupSegment(
+      record_key, sizeof(K) * shape.dim_size(0),
+      (char*)*buffer, bytes_read);
+  return shape.dim_size(0);
 }
 
-template<typename K, typename V>
-Status EVRestoreDynamicallyGPU(EmbeddingVarGPU<K, V>* ev,
-    const std::string& name_string, int partition_id,
-    int partition_num, OpKernelContext* context,
-    BundleReader* reader, const std::string& part_offset_tensor_suffix,
-    const std::string& key_suffix, const std::string& value_suffix,
-    const std::string& version_suffix, const std::string& freq_suffix) {
+template<class K, class V>
+void RestoreSsdRecord(
+    EmbeddingVar<K, V>* ev,
+    const std::string& ssd_record_file_name,
+    const std::string& ssd_emb_file_name) {
+  BundleReader ssd_record_reader(Env::Default(),
+                                 ssd_record_file_name);
+  //Read the data of embedding files
+  int64* file_list = nullptr;
+  int64 num_of_files =
+      ReadRecord(&ssd_record_reader, "files", &file_list);
 
-  // first check whether there is partition
-  if (name_string.find(part_str) == std::string::npos) {
-    Status s = EVRestoreNoPartitionGPU(
-        ev, reader, name_string + key_suffix,
-        name_string + value_suffix, context, name_string + version_suffix,
-        name_string + freq_suffix);
-    if (!s.ok()) {
-      LOG(FATAL) <<  "EV restoring fail:" << s.ToString();
-    }
-    return s;
-  }
+  int64* invalid_record_count_list = nullptr;
+  ReadRecord(&ssd_record_reader,
+             "invalid_record_count",
+             &invalid_record_count_list);
 
-  const string& curr_partid_str = std::to_string(partition_id);
-  // first find out which sub parts we should load
-  std::vector<int> loaded_parts;
-  for (int i = 0; i < kSavedPartitionNum; i++) {
-    if (i % partition_num == partition_id) {
-      loaded_parts.push_back(i);
-    }
-  }
+  int64* record_count_list = nullptr;
+  ReadRecord(&ssd_record_reader,
+             "record_count",
+             &record_count_list);
 
-  // then we use primary partition number to compose with
-  // sub partition number
-  VLOG(1) << "new form:" << name_string
-          << ", partition_id:" << partition_id
-          << ", partition_num:" << partition_num;
+  //Read the data of keys
+  K* key_list = nullptr;
+  int64 num_of_keys =
+      ReadRecord(&ssd_record_reader, "keys", &key_list);
 
-  int orig_partnum = 0;
-  size_t buffer_size = 8 << 20;
-  RestoreBuffer restore_buff;
-  restore_buff.key_buffer = new char[buffer_size];
-  restore_buff.value_buffer = new char[buffer_size];
-  char* part_buffer = new char[buffer_size];
+  int64* key_file_id_list = nullptr;
+  ReadRecord(&ssd_record_reader, "keys_file_id", &key_file_id_list);
 
-  const cudaStream_t& stream = context->eigen_device<GPUDevice>().stream();
+  int64* key_offset_list = nullptr;
+  ReadRecord(&ssd_record_reader, "keys_offset", &key_offset_list);
 
-
-  for (;  ; orig_partnum++) {
-    string part_id = std::to_string(orig_partnum);
-    string pre_subname = name_string.substr(0, name_string.find(part_str));
-    string post_subname = name_string.substr(name_string.find(part_str)
-        + part_str.size() + curr_partid_str.size());
-    string tensor_name = pre_subname + part_str + part_id + post_subname;
-
-    // first check whether is  old ckpt form
-    string tensor_key = tensor_name + key_suffix;
-    string tensor_value = tensor_name + value_suffix;
-    string offset_tensor_name = tensor_name + part_offset_tensor_suffix;
-
-    TensorShape key_shape, value_shape, version_shape, freq_shape, part_offset_shape;
-    Status st = reader->LookupTensorShape(tensor_key, &key_shape);
-    if (!st.ok()) {
-      VLOG(1) << "ev part " << tensor_key
-              << " not exist, reach the end of restoring";
-      break;
-    }
-    st = reader->LookupTensorShape(tensor_value, &value_shape);
-    if (!st.ok()) {
-      break;
-    }
-
-    st = reader->LookupTensorShape(offset_tensor_name, &part_offset_shape);
-    if (!st.ok()) {
-      break;
-    }
-
-    st = reader->LookupHeader(tensor_key, sizeof(K) * key_shape.dim_size(0));
-    if (!st.ok()) {
-      break;
-    }
-    
-    st = reader->LookupHeader(tensor_value,
-        sizeof(V) * value_shape.dim_size(0) * value_shape.dim_size(1));
-    if (!st.ok()) {
-      break;
-    }
-
-    st = reader->LookupHeader(offset_tensor_name, sizeof(int32) * (kSavedPartitionNum + 1));
-    if (!st.ok()) {
-      break;
-    }
-
-    size_t tot_part_bytes_read(0);
-    st = reader->LookupSegment(offset_tensor_name, (kSavedPartitionNum + 1) * sizeof(int32),
-        part_buffer, tot_part_bytes_read);
-
-    for (size_t i = 0; i < loaded_parts.size(); i++) {
-      int32* part_offset = (int32*)part_buffer;
-      int subpart_id = loaded_parts[i];
-      int subpart_offset = part_offset[subpart_id];
-
-      size_t value_unit_bytes = sizeof(V) *  value_shape.dim_size(1);
-      int64 tot_key_num = part_offset[subpart_id + 1] - subpart_offset;
-      int64 key_part_offset = subpart_offset * sizeof(K);
-      int64 value_part_offset = subpart_offset *  value_unit_bytes;
-  
-      VLOG(1) << "dynamically load ev : " << name_string
-              << ", subpartid:" << loaded_parts[i]
-              << ", subpart_offset:" << subpart_offset
-              << ", partition_id:" << partition_id
-              << ", partition_num:" << partition_num
-              << ", keynum:" << tot_key_num;
-
-      int64 tot_key_bytes_read(0);
-      int64 tot_value_bytes_read(0);
-      size_t key_bytes_read = 0;
-      size_t value_bytes_read = 0;
-      while(tot_key_num > 0) {
-        size_t read_key_num = std::min(std::min(buffer_size / sizeof(K),
-              buffer_size / value_unit_bytes), buffer_size / sizeof(int64));
-        read_key_num = std::min((int64)read_key_num, tot_key_num);
-        reader->LookupSegmentOffset(tensor_key,
-            key_part_offset + tot_key_bytes_read, read_key_num * sizeof(K),
-            restore_buff.key_buffer, key_bytes_read);
-
-        reader->LookupSegmentOffset(tensor_value,
-            value_part_offset + tot_value_bytes_read,
-            read_key_num * value_unit_bytes, restore_buff.value_buffer,
-            value_bytes_read);
-
-        if (key_bytes_read > 0) {
-          read_key_num = key_bytes_read / sizeof(K);
-          VLOG(2) << "restore, read_key_num:" << read_key_num;
-          st = ev->Import(restore_buff, read_key_num, kSavedPartitionNum,
-              partition_id, partition_num, false, stream);
-          if (!st.ok()) {
-            LOG(FATAL) <<  "EV restoring fail:" << st.ToString();
-          }
-        }
-        tot_key_num -= read_key_num;
-        tot_key_bytes_read += key_bytes_read;
-        tot_value_bytes_read += value_bytes_read;
-        
-      }
-    }
-  }
-  return Status::OK();
+  //Import the meta of keys to SSDHashKV
+  ev->RestoreSsdHashmap(key_list, key_file_id_list,
+                        key_offset_list, num_of_keys,
+                        file_list, invalid_record_count_list,
+                        record_count_list, num_of_files,
+                        ssd_emb_file_name);
+  delete[] key_list;
+  delete[] key_file_id_list;
+  delete[] key_offset_list;
+  delete[] file_list;
+  delete[] invalid_record_count_list;
+  delete[] record_count_list;
 }
-#endif // TENSORFLOW_USE_GPU_EV
-#endif  // GOOGLE_CUDA
 
+template<class K, class V>
+void LoadSsdData(
+    EmbeddingVar<K, V>* ev,
+    const std::string& ssd_record_file_name,
+    const std::string& ssd_emb_file_name) {
+  BundleReader ssd_record_reader(Env::Default(),
+                                 ssd_record_file_name);
+  std::string record_key;
+
+  K* key_list = nullptr;
+  int64 num_of_keys =
+      ReadRecord(&ssd_record_reader, "keys", &key_list);
+
+  int64* key_file_id_list = nullptr;
+  ReadRecord(&ssd_record_reader, "keys_file_id", &key_file_id_list);
+
+  int64* key_offset_list = nullptr;
+  ReadRecord(&ssd_record_reader, "keys_offset", &key_offset_list);
+
+  //Load keys and embedding data on ssd
+  ev->LoadSsdData(ssd_emb_file_name, key_list,
+                  key_file_id_list, key_offset_list,
+                  num_of_keys);
+  delete[] key_list;
+  delete[] key_file_id_list;
+  delete[] key_offset_list;
+}
+
+Status MoveMatchingFiles(
+    Env* env,
+    const tstring& pattern,
+    const tstring& merged_prefix,
+    int64 input_prefix_size);
+
+/*Move two files and one directory:
+1. xxxxx-ssd_record.index
+2. xxxxx-ssd_record.data 
+3. xxxxxx-emb_files/ 
+1 and 2 record the meta data of SSDHash,
+and 3 records the embeddings on SSD*/
+Status MoveSsdFiles(Env* env,
+    const gtl::ArraySlice<tstring>& input_prefixes,
+    const tstring& merged_prefix);
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_KERNELS_KV_VARIABLE_OPS_H_

@@ -12,6 +12,7 @@ load(
     "tf_cc_tests",
     "tf_copts",
     "tf_cuda_library",
+    "cuda_library",
     "tf_kernel_library",
     "tf_mkl_kernel_library",
     "tf_opts_nortti_if_android",
@@ -1900,7 +1901,7 @@ tf_cc_test(
     ],
 )
 
-tf_cc_test(
+tf_cuda_cc_test(
     name = "fused_batch_norm_op_test",
     size = "small",
     srcs = ["fused_batch_norm_op_test.cc"],
@@ -2254,7 +2255,7 @@ tf_cc_test(
     ],
 )
 
-tf_cc_test(
+tf_cuda_cc_test(
     name = "unique_op_test",
     size = "small",
     srcs = ["unique_op_test.cc"],
@@ -2262,6 +2263,7 @@ tf_cc_test(
         ":ops_testutil",
         ":ops_util",
         ":unique_ali_op",
+        ":host_constant_op",
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
@@ -2826,11 +2828,9 @@ tf_kernel_library(
 tf_kernel_library(
     name = "kv_variable_ops",
     hdrs = ["kv_variable_ops.h"],
-    srcs = ["kv_variable_ops.cc"],
-    gpu_srcs = [
-        "kv_variable_ops_gpu.cu.cc",
-        "kv_variable_ops_gpu.h",
-    ],
+    srcs = ["kv_variable_ops.cc",
+            "kv_variable_lookup_ops.cc",
+            "kv_variable_save_restore_ops.cc"],
     copts = ["-g"],
     nocopts = "-fno-exceptions",
     deps = [
@@ -2842,6 +2842,7 @@ tf_kernel_library(
         ":state",
         ":training_op_helpers",
         ":variable_ops",
+        ":embedding_var_cu_cc",
         "//tensorflow/core:embedding_gpu",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
@@ -2851,9 +2852,34 @@ tf_kernel_library(
         "@sparsehash_c11//:dense_hash_map",
         "@libcuckoo//:libcuckoo",
         "@com_github_google_leveldb//:leveldb",
-    ] + select({"//tensorflow:with_gpu_ev_support":
-                 ["@cuCollections//:cuco_hash_table"],
-                 "//conditions:default": []}),
+        "@cuCollections//:cuco_hash_table"
+    ],
+)
+
+cuda_library(
+    name = "embedding_var_cu_cc",
+    hdrs = [
+        "//tensorflow/core:common_runtime/gpu/gpu_event_mgr.h"
+    ],
+    srcs = [
+        "//tensorflow/core:framework/embedding/embedding_var.cu.cc"
+    ],
+    copts = ["-g"]
+        + if_cuda(["-DGOOGLE_CUDA=1"]) +
+        select({
+        "//conditions:default": [],
+        "@local_config_cuda//cuda:using_nvcc": [
+            "-nvcc_options=relaxed-constexpr",
+        ],
+        "@local_config_cuda//cuda:using_clang": [
+            "-fcuda-flush-denormals-to-zero",
+        ],
+        }),
+    nocopts = "-fno-exceptions",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tensorflow/core:stream_executor",
+        "//tensorflow/core/kernels:gpu_device_array"] + ["//third_party/eigen3"]
 )
 
 tf_kernel_library(
@@ -5321,6 +5347,47 @@ tf_kernel_library(
     deps = REQUIRED_DEPS,
 )
 
+tf_kernel_library(
+    name = "group_embedding_ops",
+    gpu_srcs = ["group_lookup_forward.cu.cc",
+                "group_lookup_backward.cu.cc",],
+    deps = ["//third_party/eigen3",
+            "//tensorflow/core/kernels:gpu_device_array",
+            ":training_op_helpers",
+            ":variable_ops",
+            "//tensorflow/core:embedding_gpu",
+            "@sparsehash_c11//:dense_hash_map",
+            "@libcuckoo//:libcuckoo",
+            "@com_github_google_leveldb//:leveldb",] + DYNAMIC_DEPS + mkl_deps() +
+           if_cuda(["@cub_archive//:cub",
+                    ":fused_embedding_common_cuh",
+                    "@cuCollections//:cuco_hash_table"]),
+)
+
+tf_cuda_cc_test(
+    name = "group_embedding_ops_test",
+    size = "small",
+    srcs = ["group_lookup_ops_test.cc"],
+    tags = tf_cuda_tests_tags(),
+    extra_copts = ["-fexceptions", "-g"],
+    deps = [
+        ":group_embedding_ops",
+        ":kv_variable_ops",
+        ":ops_testutil",
+        ":ops_util",
+        "//tensorflow/cc:cc_ops",
+        "//tensorflow/core:core_cpu",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:framework_internal",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core:tensorflow",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/core:testlib",
+    ],
+)
+
 tf_cc_test(
     name = "sendrecv_ops_test",
     srcs = ["sendrecv_ops_test.cc"],
@@ -6291,6 +6358,7 @@ tf_kernel_library(
         "training_ali_ops.h"
     ],
     copts = ["-g"],
+    nocopts = "-fno-exceptions",
     deps = [
         ":bounds_check",
         ":training_op_helpers",
@@ -8945,16 +9013,18 @@ tf_kernel_library(
 
 tf_kernel_library(
     name = "unique_ali_op",
-    prefix = "unique_ali_op",
+    srcs = ["unique_ali_op.cc"],
+    hdrs = ["unique_ali_op_util.h",
+            "task_runner.h",],
+    gpu_srcs = [
+        "unique_ali_op_gpu.cu.cc",
+    ],
     copts = ["-fexceptions"],
     nocopts = "-fno-exceptions",
-    hdrs = [
-        "task_runner.h",
-    ],
     deps = ARRAY_DEPS + [
         "@com_google_absl//absl/container:flat_hash_map",
         "@sparsehash_c11//:dense_hash_map",
-    ],
+    ] + if_cuda([":cuda_solvers", "@cub_archive//:cub",])
 )
 
 tf_kernel_library(

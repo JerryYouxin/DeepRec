@@ -326,6 +326,13 @@ def build_model_input(filename, batch_size, num_epochs, seed, stock_tf, workqueu
         features = all_columns
         return features, label
 
+    def parse_parquet(value):
+        tf.logging.info('Parsing {}'.format(filename))
+        labels = [value.pop(LABEL_COLUMNS[0]), value.pop(LABEL_COLUMNS[1])]
+        label = tf.multiply(labels[0], labels[1])
+        features = value
+        return features, label
+    
     '''Work Queue Feature'''
     if not stock_tf and workqueue:
         from tensorflow.python.ops.work_queue import WorkQueue
@@ -333,12 +340,22 @@ def build_model_input(filename, batch_size, num_epochs, seed, stock_tf, workqueu
         files = work_queue.input_dataset()
     else:
         files = filename
-    return (tf.data.TextLineDataset(files)
-            .shuffle(buffer_size=10000, seed=seed)
-            .repeat(num_epochs)
-            .batch(batch_size)
-            .map(parse_csv, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-            .prefetch(2))
+    if args.parquet_dataset and not args.tf:
+        from tensorflow.python.data.experimental.ops import parquet_dataset_ops
+        dataset = parquet_dataset_ops.ParquetDataset(files, batch_size=batch_size)
+        if args.parquet_dataset_shuffle:
+            dataset = dataset.shuffle(buffer_size=10000,
+                                      seed=seed)  # fix seed for reproducing
+        dataset = dataset.repeat(num_epochs)
+        dataset = dataset.map(parse_parquet, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    else:
+        dataset = tf.data.TextLineDataset(files)
+        dataset = dataset.shuffle(buffer_size=10000, seed=seed)
+        dataset = dataset.repeat(num_epochs)
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.map(parse_csv, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.prefetch(2)
+    return dataset
 
 # generate feature columns
 def build_feature_columns(stock_tf,
@@ -351,78 +368,151 @@ def build_feature_columns(stock_tf,
     user_column = []
     item_column = []
     combo_column = []
-    for column_name in ALL_FEATURE_COLUMNS:
-        column = tf.feature_column.categorical_column_with_hash_bucket(
-            column_name,
-            hash_bucket_size=HASH_BUCKET_SIZES[column_name],
-            dtype=tf.string)
-
-        if not stock_tf:
-            '''Feature Elimination of EmbeddingVariable Feature'''
-            if emb_var_elimination == 'gstep':
-                # Feature elimination based on global steps
-                evict_opt = tf.GlobalStepEvict(steps_to_live=4000)
-            elif emb_var_elimination == 'l2':
-                # Feature elimination based on l2 weight
-                evict_opt = tf.L2WeightEvict(l2_weight_threshold=1.0)
-            else:
-                evict_opt = None
-
-            '''Feature Filter of EmbeddingVariable Feature'''
-            if emb_var_filter == 'cbf':
-                # CBF-based feature filter
-                filter_option = tf.CBFFilter(filter_freq=3,
-                                             max_element_size=2**30,
-                                             false_positive_probability=0.01,
-                                             counter_type=tf.int64)
-            elif emb_var_filter == 'counter':
-                # Counter-based feature filter
-                filter_option = tf.CounterFilter(filter_freq=3)
-            else:
-                filter_option = None
-
-            ev_opt = tf.EmbeddingVariableOption(evict_option=evict_opt, filter_option=filter_option)
-
-            if emb_variable:
-                '''Embedding Variable Feature'''
-                column = tf.feature_column.categorical_column_with_embedding(column_name,
-                                                                             dtype=tf.string,
-                                                                             ev_option=ev_opt)
-            elif adaptive_emb:
-                '''                 Adaptive Embedding Feature Part 2 of 2
-                Except the following code, a dict, 'adaptive_mask_tensors', is needede as the input of
-                'tf.feature_column.input_layer(adaptive_mask_tensors=adaptive_mask_tensors)'.
-                For column 'COL_NAME',the value of adaptive_mask_tensors['$COL_NAME'] is an int32
-                tensor with shape [batch_size].
-                '''
-                column = tf.feature_column.categorical_column_with_adaptive_embedding(
+    if args.group_embedding and not args.tf:
+        with tf.feature_column.group_embedding_column_scope(name="categorical"):
+            for column_name in ALL_FEATURE_COLUMNS:
+                column = tf.feature_column.categorical_column_with_hash_bucket(
                     column_name,
                     hash_bucket_size=HASH_BUCKET_SIZES[column_name],
-                    dtype=tf.string,
-                    ev_option=ev_opt)
-            elif dynamic_emb_var:
-                '''Dynamic-dimension Embedding Variable'''
-                raise ValueError('Dynamic-dimension Embedding Variable is not enabled in the model')
+                    dtype=tf.string)
 
-        if not stock_tf and emb_fusion:
-            '''Embedding Fusion Feature'''
-            embedding_column = tf.feature_column.embedding_column(column,
-                                                                  dimension=16,
-                                                                  combiner='mean',
-                                                                  do_fusion=emb_fusion)
-        else:
-            embedding_column = tf.feature_column.embedding_column(column,
-                                                       dimension=16,
-                                                       combiner='mean')
+                if not stock_tf:
+                    '''Feature Elimination of EmbeddingVariable Feature'''
+                    if emb_var_elimination == 'gstep':
+                        # Feature elimination based on global steps
+                        evict_opt = tf.GlobalStepEvict(steps_to_live=4000)
+                    elif emb_var_elimination == 'l2':
+                        # Feature elimination based on l2 weight
+                        evict_opt = tf.L2WeightEvict(l2_weight_threshold=1.0)
+                    else:
+                        evict_opt = None
+
+                    '''Feature Filter of EmbeddingVariable Feature'''
+                    if emb_var_filter == 'cbf':
+                        # CBF-based feature filter
+                        filter_option = tf.CBFFilter(filter_freq=3,
+                                                    max_element_size=2**30,
+                                                    false_positive_probability=0.01,
+                                                    counter_type=tf.int64)
+                    elif emb_var_filter == 'counter':
+                        # Counter-based feature filter
+                        filter_option = tf.CounterFilter(filter_freq=3)
+                    else:
+                        filter_option = None
+
+                    ev_opt = tf.EmbeddingVariableOption(evict_option=evict_opt, filter_option=filter_option)
+
+                    if emb_variable:
+                        '''Embedding Variable Feature'''
+                        column = tf.feature_column.categorical_column_with_embedding(column_name,
+                                                                                    dtype=tf.string,
+                                                                                    ev_option=ev_opt)
+                    elif adaptive_emb:
+                        '''                 Adaptive Embedding Feature Part 2 of 2
+                        Except the following code, a dict, 'adaptive_mask_tensors', is needede as the input of
+                        'tf.feature_column.input_layer(adaptive_mask_tensors=adaptive_mask_tensors)'.
+                        For column 'COL_NAME',the value of adaptive_mask_tensors['$COL_NAME'] is an int32
+                        tensor with shape [batch_size].
+                        '''
+                        column = tf.feature_column.categorical_column_with_adaptive_embedding(
+                            column_name,
+                            hash_bucket_size=HASH_BUCKET_SIZES[column_name],
+                            dtype=tf.string,
+                            ev_option=ev_opt)
+                    elif dynamic_emb_var:
+                        '''Dynamic-dimension Embedding Variable'''
+                        raise ValueError('Dynamic-dimension Embedding Variable is not enabled in the model')
+
+                if not stock_tf and emb_fusion:
+                    '''Embedding Fusion Feature'''
+                    embedding_column = tf.feature_column.embedding_column(column,
+                                                                        dimension=16,
+                                                                        combiner='mean',
+                                                                        do_fusion=emb_fusion)
+                else:
+                    embedding_column = tf.feature_column.embedding_column(column,
+                                                            dimension=16,
+                                                            combiner='mean')
 
 
-        if column_name in USER_COLUMN:
-            user_column.append(embedding_column)
-        elif column_name in ITEM_COLUMN:
-            item_column.append(embedding_column)
-        elif column_name in COMBO_COLUMN:
-            combo_column.append(embedding_column)
+                if column_name in USER_COLUMN:
+                    user_column.append(embedding_column)
+                elif column_name in ITEM_COLUMN:
+                    item_column.append(embedding_column)
+                elif column_name in COMBO_COLUMN:
+                    combo_column.append(embedding_column)
+    else:
+        for column_name in ALL_FEATURE_COLUMNS:
+            column = tf.feature_column.categorical_column_with_hash_bucket(
+                column_name,
+                hash_bucket_size=HASH_BUCKET_SIZES[column_name],
+                dtype=tf.string)
 
+            if not stock_tf:
+                '''Feature Elimination of EmbeddingVariable Feature'''
+                if emb_var_elimination == 'gstep':
+                    # Feature elimination based on global steps
+                    evict_opt = tf.GlobalStepEvict(steps_to_live=4000)
+                elif emb_var_elimination == 'l2':
+                    # Feature elimination based on l2 weight
+                    evict_opt = tf.L2WeightEvict(l2_weight_threshold=1.0)
+                else:
+                    evict_opt = None
+
+                '''Feature Filter of EmbeddingVariable Feature'''
+                if emb_var_filter == 'cbf':
+                    # CBF-based feature filter
+                    filter_option = tf.CBFFilter(filter_freq=3,
+                                                max_element_size=2**30,
+                                                false_positive_probability=0.01,
+                                                counter_type=tf.int64)
+                elif emb_var_filter == 'counter':
+                    # Counter-based feature filter
+                    filter_option = tf.CounterFilter(filter_freq=3)
+                else:
+                    filter_option = None
+
+                ev_opt = tf.EmbeddingVariableOption(evict_option=evict_opt, filter_option=filter_option)
+
+                if emb_variable:
+                    '''Embedding Variable Feature'''
+                    column = tf.feature_column.categorical_column_with_embedding(column_name,
+                                                                                dtype=tf.string,
+                                                                                ev_option=ev_opt)
+                elif adaptive_emb:
+                    '''                 Adaptive Embedding Feature Part 2 of 2
+                    Except the following code, a dict, 'adaptive_mask_tensors', is needede as the input of
+                    'tf.feature_column.input_layer(adaptive_mask_tensors=adaptive_mask_tensors)'.
+                    For column 'COL_NAME',the value of adaptive_mask_tensors['$COL_NAME'] is an int32
+                    tensor with shape [batch_size].
+                    '''
+                    column = tf.feature_column.categorical_column_with_adaptive_embedding(
+                        column_name,
+                        hash_bucket_size=HASH_BUCKET_SIZES[column_name],
+                        dtype=tf.string,
+                        ev_option=ev_opt)
+                elif dynamic_emb_var:
+                    '''Dynamic-dimension Embedding Variable'''
+                    raise ValueError('Dynamic-dimension Embedding Variable is not enabled in the model')
+
+            if not stock_tf and emb_fusion:
+                '''Embedding Fusion Feature'''
+                embedding_column = tf.feature_column.embedding_column(column,
+                                                                    dimension=16,
+                                                                    combiner='mean',
+                                                                    do_fusion=emb_fusion)
+            else:
+                embedding_column = tf.feature_column.embedding_column(column,
+                                                        dimension=16,
+                                                        combiner='mean')
+
+
+            if column_name in USER_COLUMN:
+                user_column.append(embedding_column)
+            elif column_name in ITEM_COLUMN:
+                item_column.append(embedding_column)
+            elif column_name in COMBO_COLUMN:
+                combo_column.append(embedding_column)
     return user_column, item_column, combo_column
 
 def train(sess_config,
@@ -513,8 +603,11 @@ def eval(sess_config, input_hooks, model, test_init_op, test_steps, output_dir, 
 def main(stock_tf, tf_config=None, server=None):
     # check dataset and count data set size
     print('Checking dataset...')
-    train_file = os.path.join(args.data_location, 'taobao_train_data')
-    test_file = os.path.join(args.data_location, 'taobao_test_data')
+    train_file = args.data_location + '/taobao_train_data'
+    test_file = args.data_location + '/taobao_test_data'
+    if args.parquet_dataset and not args.tf:
+        train_file += '.parquet'
+        test_file += '.parquet'
     if not os.path.exists(args.data_location):
         raise ValueError(f'[ERROR] data location: {args.data_location} does not exist. '
                          'Please provide valid path')
@@ -522,9 +615,15 @@ def main(stock_tf, tf_config=None, server=None):
     if not os.path.exists(train_file) or not os.path.exists(test_file):
         raise ValueError('[ERROR] taobao_train_data or taobao_test_data does not exist '
                          'in the given data_location. Please provide valid path')
-
-    no_of_training_examples = sum(1 for _ in open(train_file))
-    no_of_test_examples = sum(1 for _ in open(test_file))
+    no_of_training_examples = 0
+    no_of_test_examples = 0
+    if args.parquet_dataset and not args.tf:
+        import pyarrow.parquet as pq
+        no_of_training_examples = pq.read_table(train_file).num_rows
+        no_of_test_examples = pq.read_table(test_file).num_rows
+    else:
+        no_of_training_examples = sum(1 for _ in open(train_file))
+        no_of_test_examples = sum(1 for _ in open(test_file))
 
     # set batch size, eporch & steps
     batch_size = math.ceil(
@@ -582,8 +681,10 @@ def main(stock_tf, tf_config=None, server=None):
     train_dataset = build_model_input(train_file, batch_size, no_epochs, SEED, stock_tf, args.workqueue)
     test_dataset = build_model_input(test_file, batch_size, 1, SEED, stock_tf, args.workqueue)
 
-    iterator = tf.data.Iterator.from_structure(train_dataset.output_types,
-                                               train_dataset.output_shapes)
+    dataset_output_types = tf.data.get_output_types(train_dataset)
+    dataset_output_shapes = tf.data.get_output_shapes(test_dataset)
+    iterator = tf.data.Iterator.from_structure(dataset_output_types,
+                                               dataset_output_shapes)
     next_element = iterator.get_next()
 
     train_init_op = iterator.make_initializer(train_dataset)
@@ -778,6 +879,18 @@ def get_arg_parser():
                         help='Whether to enable WorkQueue',
                         type=boolean_string,
                         default=False)
+    parser.add_argument("--parquet_dataset", \
+                        help='Whether to enable Parquet DataSet. Defualt to True.',
+                        type=boolean_string,
+                        default=True)
+    parser.add_argument("--parquet_dataset_shuffle", \
+                        help='Whether to enable shuffle operation for Parquet Dataset. Default to False.',
+                        type=boolean_string,
+                        default=False)
+    parser.add_argument("--group_embedding", \
+                        help='Whether to enable Group Embedding. Defualt to False.',
+                        action='store_true')
+
     return parser
 
 # Parse distributed training configuration and generate cluster information
@@ -856,6 +969,8 @@ def set_env_for_DeepRec():
     os.environ['STOP_STATISTIC_STEP'] = '110'
     os.environ['MALLOC_CONF'] = \
         'background_thread:true,metadata_thp:auto,dirty_decay_ms:20000,muzzy_decay_ms:20000'
+    if args.group_embedding:
+        tf.config.experimental.enable_distributed_strategy(strategy="localized")
 
 def check_stock_tf():
     import pkg_resources
@@ -865,7 +980,7 @@ def check_stock_tf():
 def check_DeepRec_features():
     return args.smartstaged or args.emb_fusion or args.op_fusion or args.micro_batch or args.bf16 or \
            args.ev or args.adaptive_emb or args.dynamic_ev or (args.optimizer == 'adamasync') or \
-           args.incremental_ckpt  or args.workqueue
+           args.incremental_ckpt  or args.workqueue and args.group_embedding
 
 if __name__ == '__main__':
     parser = get_arg_parser()

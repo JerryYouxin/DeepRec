@@ -4,7 +4,7 @@ package tensorflow.embedding;
 
 enum StorageType {
   // none
-  INVALID = 0;
+  DEFAULT = 0;
 
   // one level
   DRAM = 1;
@@ -12,6 +12,7 @@ enum StorageType {
   PMEM_LIBPMEM = 3;
   SSDHASH = 4;
   LEVELDB = 5;
+  HBM = 6;
 
   // two level
   DRAM_PMEM = 11;
@@ -23,6 +24,12 @@ enum StorageType {
   DRAM_PMEM_SSDHASH = 101;
   HBM_DRAM_SSDHASH = 102;
 
+}
+
+enum CopyBackFlag {
+  NOT_COPYBACK = 0;
+  COPYBACK = 1;
+  COPYBACK_AND_DESTROY = 2;
 }
 
 enum SlotType {

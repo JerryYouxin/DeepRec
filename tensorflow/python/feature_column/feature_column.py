@@ -155,6 +155,7 @@ from tensorflow.python.ops import lookup_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import parsing_ops
+from tensorflow.python.ops import partitioned_variables
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import sparse_ops
 from tensorflow.python.ops import string_ops
@@ -167,6 +168,7 @@ from tensorflow.python.training import checkpoint_utils
 from tensorflow.python.util import nest
 from tensorflow.python.util.tf_export import tf_export
 from tensorflow.python.util.compat import collections_abc
+from tensorflow.python.feature_column import group_embedding_column as gec
 
 
 def _internal_input_layer(features,
@@ -193,35 +195,44 @@ def _internal_input_layer(features,
   if ops.GraphKeys.MODEL_VARIABLES not in weight_collections:
     weight_collections.append(ops.GraphKeys.MODEL_VARIABLES)
 
+  
+
   def _get_logits():  # pylint: disable=missing-docstring
     builder = _LazyBuilder(features, adaptive_mask_tensors)
     output_tensors = []
     ordered_columns = []
+    group_embedding_tensor = gec._get_global_group_embedding_scope(builder, weight_collections, trainable)
+
     for column in sorted(feature_columns, key=lambda x: x.name):
+      group_name = getattr(column, 'group_name', '')
       ordered_columns.append(column)
       with variable_scope.variable_scope(
           None, default_name=column._var_scope_name):  # pylint: disable=protected-access
-        tensor = column._get_dense_tensor(  # pylint: disable=protected-access
-            builder,
-            weight_collections=weight_collections,
-            trainable=trainable)
-        output_shape = column._output_shape(tensor)  # pylint: disable=protected-access
-        batch_size = array_ops.shape(tensor)[0]
-        output_tensor = array_ops.reshape(
-            tensor, shape=output_shape)
-        output_tensors.append(output_tensor)
-        if cols_to_vars is not None:
-          # Retrieve any variables created (some _DenseColumn's don't create
-          # variables, in which case an empty list is returned).
-          cols_to_vars[column] = ops.get_collection(
-              ops.GraphKeys.GLOBAL_VARIABLES,
-              scope=variable_scope.get_variable_scope().name)
-        if cols_to_output_tensors is not None:
-          cols_to_output_tensors[column] = output_tensor
-        ops.add_to_collections(ops.GraphKeys.ASYNC_EMBEDDING_OUTPUT_TENSORS, output_tensor)
+        if group_name != '':
+          output_tensors.append(group_embedding_tensor[column])
+        else:
+          tensor = column._get_dense_tensor(  # pylint: disable=protected-access
+              builder,
+              weight_collections=weight_collections,
+              trainable=trainable)
+          output_shape = column._output_shape(tensor)  # pylint: disable=protected-access
+          batch_size = array_ops.shape(tensor)[0]
+          output_tensor = array_ops.reshape(
+              tensor, shape=output_shape)
+          output_tensors.append(output_tensor)
+          if cols_to_vars is not None:
+            # Retrieve any variables created (some _DenseColumn's don't create
+            # variables, in which case an empty list is returned).
+            cols_to_vars[column] = ops.get_collection(
+                ops.GraphKeys.GLOBAL_VARIABLES,
+                scope=variable_scope.get_variable_scope().name)
+          if cols_to_output_tensors is not None:
+            cols_to_output_tensors[column] = output_tensor
+          ops.add_to_collections(ops.GraphKeys.ASYNC_EMBEDDING_OUTPUT_TENSORS, output_tensor)
+      
     _verify_static_batch_size_equality(output_tensors, ordered_columns)
     return array_ops.concat(output_tensors, -1)
-
+    
   # If we're constructing from the `make_template`, that by default adds a
   # variable scope with the name of the layer. In that case, we dont want to
   # add another `variable_scope` as that would break checkpoints.
@@ -231,7 +242,6 @@ def _internal_input_layer(features,
     with variable_scope.variable_scope(
         scope, default_name='input_layer', values=features.values()):
       return _get_logits()
-
 
 @tf_export(v1=['feature_column.input_layer'])
 def input_layer(features,

@@ -116,20 +116,20 @@ test --define open_source_build=true
 # environment variable "TF_MKL_ROOT" every time before build.
 build:mkl --define=build_with_mkl=true --define=enable_mkl=true
 build:mkl --define=tensorflow_dnnl_contraction_kernel=0
-build:mkl -c opt
+build:mkl -c opt --copt=-O3
 
 # config to build OneDNN backend with a user specified threadpool.
 build:mkl_threadpool --define=build_with_mkl=true --define=enable_mkl=true
 build:mkl_threadpool --define=tensorflow_dnnl_contraction_kernel=0
 build:mkl_threadpool --define=build_with_mkl_opensource=true
 build:mkl_threadpool --define=build_with_mkldnn_threadpool=true
-build:mkl_threadpool -c opt
+build:mkl_threadpool -c opt --copt=-O3
 
 # Config setting to build with oneDNN and without the binary blob
 build:mkl_opensource_only --define=build_with_mkl=true --define=enable_mkl=true
 build:mkl_opensource_only --define=tensorflow_dnnl_contraction_kernel=0
 build:mkl_opensource_only --define=build_with_mkl_opensource=true
-build:mkl_opensource_only -c opt
+build:mkl_opensource_only -c opt --copt=-O3
 
 # This config option is used to enable OneDNN open source library only,
 # without depending on OneDNN binary version.
@@ -137,6 +137,13 @@ build:mkl_open_source_only --define=build_with_mkl_dnn_only=true
 build:mkl_open_source_only --define=build_with_mkl_dnn_v1_only=true
 build:mkl_open_source_only --define=build_with_mkl=true --define=enable_mkl=true
 build:mkl_open_source_only --define=tensorflow_dnnl_contraction_kernel=0
+
+# Config setting to build oneDNN with Compute Library for the Arm Architecture (ACL).
+# This build is for the inference regime only.
+build:mkl_aarch64 --define=build_with_mkl_aarch64=true
+build:mkl_aarch64 --define=tensorflow_mkldnn_contraction_kernel=0
+build:mkl_aarch64 --define=build_with_openmp=true
+build:mkl_aarch64 -c opt
 
 # This config refers to building with CUDA available. It does not necessarily
 # mean that we build CUDA op kernels.
@@ -197,7 +204,7 @@ build --define=use_fast_cpp_protos=true
 build --define=allow_oversize_protos=true
 
 build --spawn_strategy=standalone
-build -c opt
+build -c opt --copt=-O3
 
 # Make Bazel print out all options from rc files.
 build --announce_rc

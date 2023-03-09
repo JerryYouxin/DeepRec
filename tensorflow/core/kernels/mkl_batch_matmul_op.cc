@@ -25,7 +25,6 @@ limitations under the License.
 
 #if defined(INTEL_MKL)
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -41,6 +40,7 @@ limitations under the License.
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/matmul_bcast.h"
 #include "tensorflow/core/util/mkl_util.h"
+#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 
 namespace tensorflow {
 
@@ -158,13 +158,56 @@ class BatchMatMulMkl : public OpKernel {
     MklMatMulPrimitive<Scalar>* matmul_prim =
         MklMatMulPrimitiveFactory<Scalar>::Get(
             *params, false /* value for do_not_cache */);
+    
+    Scalar* weight_data = const_cast<Scalar*>(rhs.flat<Scalar>().data());
+#ifdef DNNL_AARCH64_USE_ACL
+    memory::format_tag weight_format;
+    switch (params->b_dims.size()) {
+      case 2:
+        weight_format =
+            adj_y_ ? memory::format_tag::ba : memory::format_tag::ab;
+        break;
+      case 3:
+        weight_format =
+            adj_y_ ? memory::format_tag::acb : memory::format_tag::abc;
+        break;
+      case 4:
+        weight_format =
+            adj_y_ ? memory::format_tag::abdc : memory::format_tag::abcd;
+        break;
+      case 5:
+        weight_format =
+            adj_y_ ? memory::format_tag::abced : memory::format_tag::abcde;
+        break;
+      default:
+        weight_format = memory::format_tag::undef;
+    }
+    MklDnnData<Scalar> weights_mkl(&(this->cpu_engine_));
+    if (weight_format != memory::format_tag::undef) {
+      auto weight_md =
+          memory::desc(params->b_dims, MklDnnType<Scalar>(), weight_format);
+      std::shared_ptr<dnnl::matmul::primitive_desc> matmul_pd =
+          matmul_prim->GetPrimitiveDesc();
+      // Reorder weights if necessary.
+      // Check whether we need to do reorder.
+      if (weight_md != matmul_pd->weights_desc()) {
+        weights_mkl.SetUsrMem(weight_md, weight_data);
+        weights_mkl.CheckReorderToOpMem(matmul_pd.get()->weights_desc(),
+                                        this->cpu_engine_, ctx);
+        weight_data =
+            reinterpret_cast<Scalar*>(weights_mkl.GetOpMem().get_data_handle());
+      }
+    }
+#endif  // DNNL_AARCH64_USE_ACL
+
     // Execute matmul primitive.
     std::shared_ptr<stream> cpu_stream;
     MklDnnThreadPool eigen_tp(ctx);
     cpu_stream.reset(CreateStream(&eigen_tp, matmul_prim->GetEngine()));
-    matmul_prim->Execute(lhs.flat<Scalar>().data(), rhs.flat<Scalar>().data(),
+    matmul_prim->Execute(lhs.flat<Scalar>().data(), weight_data,
                          out->flat<Scalar>().data(), cpu_stream);
   }
+  
  protected:
   void set_fuse_mul(bool fuse_mul) { fuse_mul_ = fuse_mul; }
 
@@ -175,6 +218,9 @@ class BatchMatMulMkl : public OpKernel {
   float alpha_;
   float beta_;
   BatchMatMulV2Op<CPUDevice, Scalar> eigen_batch_mm_v2_;
+#ifdef DNNL_AARCH64_USE_ACL
+  engine cpu_engine_ = engine(engine::kind::cpu, 0);
+#endif
 
   using dims = dnnl::memory::dims;
 

@@ -121,6 +121,12 @@ class Executor {
     CostRunner cost_runner = nullptr;
 
     ExecutorPolicy executor_policy = ExecutorPolicy::USE_NORMAL_EXECUTOR;
+
+    // store refs to cpu tensors that will be sent to gpu,
+    // and release them when the session run finishes.
+    std::unique_ptr<mutex> ref_send_inputs_mu_ptr;
+    std::vector<std::unique_ptr<TensorReference>>* ref_send_inputs_ptr = nullptr;
+    bool merge_compute_and_copy_stream = false;
   };
   typedef std::function<void(const Status&)> DoneCallback;
   virtual void RunAsync(const Args& args, DoneCallback done) = 0;
@@ -160,6 +166,9 @@ struct LocalExecutorParams {
   std::function<void(OpKernel*)> delete_kernel;
 
   Executor::RendezvousFactory rendezvous_factory;
+
+  // If true, will use cost_model_executor to run the graph.
+  bool run_cost_model_executor = false;
 };
 
 // Creates an Executor that computes the given "graph".

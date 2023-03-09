@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <string>
 #include "tensorflow/cc/framework/grad_op_registry.h"
 #include "tensorflow/cc/framework/gradient_checker.h"
 #include "tensorflow/cc/framework/testutil.h"
@@ -30,6 +31,7 @@ using ops::AvgPool;
 using ops::AvgPool3D;
 using ops::BiasAdd;
 using ops::Conv2D;
+using ops::Conv2DBackpropInput;
 using ops::Elu;
 using ops::FractionalAvgPool;
 using ops::FractionalMaxPool;
@@ -339,6 +341,17 @@ TEST_F(NNGradTest, FractionalMaxPoolGradHelper) {
   SetRandomValuesForMaxPooling<float>(&x_init_value);
   TensorShape y_shape({1, 2, 3, 1});
   RunTest(x, x_init_value, y.output, y_shape);
+}
+
+TEST_F(NNGradTest, Conv2DBackpropInputGrad) {
+  TensorShape shape({1, 2, 2, 1});
+  TensorShape filter_shape({1, 1, 1, 1});
+  auto out = Placeholder(scope_, DT_FLOAT, Placeholder::Shape(shape));
+  auto filter = Placeholder(scope_, DT_FLOAT, Placeholder::Shape(filter_shape));
+  const std::vector<int> strides{1, 1, 1, 1};
+  auto y = Conv2DBackpropInput(scope_, ops::Shape(scope_, out), filter, out,
+                               strides, "SAME");
+  RunTest({out, filter}, {shape, filter_shape}, {y}, {shape});
 }
 
 }  // namespace

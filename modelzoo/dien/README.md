@@ -93,6 +93,7 @@ The following is a brief directory structure and description for this example:
       - `--smartstaged`: Whether to enable smart staged feature of DeepRec, Default to True.
       - `--micro_batch`: Set num for Auto Mirco Batch. Default 0 to close.(Not really enabled)
       - `--ev`: Whether to enable DeepRec EmbeddingVariable. Default to False.
+      - `--group_embedding`: Use GroupEmbedding features.
       - `--adaptive_emb`: Whether to enable Adaptive Embedding. Default to False.
       - `--ev_elimination`: Set Feature Elimination of EmbeddingVariable Feature. Options [None, 'l2', 'gstep'], default to None.
       - `--ev_filter`: Set Feature Filter of EmbeddingVariable Feature. Options [None, 'counter', 'cbf'], default to None.
@@ -101,6 +102,8 @@ The following is a brief directory structure and description for this example:
       - `--incremental_ckpt`: Set time of save Incremental Checkpoint. Default 0 to close.
       - `--workqueue`: Whether to enable Work Queue. Default to False.
       - `--protocol`: Set the protocol ['grpc', 'grpc++', 'star_server'] used when starting server in distributed training. Default to grpc. 
+      - `--parquet_dataset`: Whether to enable ParquetDataset. Default is `True`.
+      - `--parquet_dataset_shuffle`: Whether to enable shuffle operation for Parquet Dataset. Default to `False`.
     - Basic Settings:
       - `--data_location`: Full path of train & eval data, default to `./data`.
       - `--steps`: Set the number of steps on train dataset. Default will be set to 1 epoch.
@@ -237,8 +240,14 @@ The benchmark is performed on the [Alibaba Cloud ACK Service(Alibaba Cloud Conta
 ## Dataset
 Amazon Dataset Books dataset is used as benchmark dataset.
 ### Prepare
+We provide the dataset in two formats:
+1. **CSV Format**
 Put data file into ./data/    
-For details of Data download, see [Data Preparation](data/README.md)
+For details of Data download, see [Data Preparation](data/README.md).
+We also provide these files at [Amazon CSV Dataset](https://deeprec-dataset.oss-cn-beijing.aliyuncs.com/csv_dataset/amazon_dataset_books.tar.xz).
+2. **Parquet Format**
+Put data file into ./data/
+These files are available at [Amazon Parquet Dataset](https://deeprec-dataset.oss-cn-beijing.aliyuncs.com/parquet_dataset/amazon_dataset_books.tar.gz).
 
 ### Fields
 - cat_voc.pkl: Contain a list of book categories.

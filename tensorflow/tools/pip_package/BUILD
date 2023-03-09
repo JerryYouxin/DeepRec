@@ -59,6 +59,9 @@ COMMON_PIP_DEPS = [
     "README",
     "setup.py",
     ":included_headers",
+    "//tensorflow/core/kernels/data:captured_function_headers",
+    "//tensorflow/core/kernels/data:name_utils_headers",
+    "//tensorflow/core/kernels/data:dataset_utils_headers",
     "//tensorflow:tensorflow_py",
     "//tensorflow/examples/saved_model/integration_tests:mnist_util",
     "//tensorflow/python/autograph/core:test_lib",
@@ -299,4 +302,18 @@ genrule(
         "//tensorflow:windows": "md5sum $(locations :build_pip_package) $(locations :simple_console_for_windows) > $@",
     }),
     visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "build_sok",
+    srcs = [
+        "build_sok.sh"
+    ],
+    data = [
+        "@cuCollections//:cuco_hash_table",
+        "@sparsehash_c11//:dense_hash_map",
+        "@com_github_google_leveldb//:leveldb",
+        "@hugectr//:hugectr",
+        "//tensorflow/core/kernels:gpu_device_array"
+    ]
 )

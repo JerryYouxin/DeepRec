@@ -155,9 +155,11 @@ http_archive(
 
 http_archive(
     name = "com_github_nelhage_rules_boost",
-    sha256 = "f8c9653c1c49489c04f9f87ab1ee93d7b59bb26a39d9e30e9687fca3c6197c3f",
-    strip_prefix = "rules_boost-9f9fb8b2f0213989247c9d5c0e814a8451d18d7f",
-    urls = ["https://github.com/nelhage/rules_boost/archive/9f9fb8b2f0213989247c9d5c0e814a8451d18d7f.tar.gz"],
+    sha256 = "4031539fe0af832c6b6ed6974d820d350299a291ba7337d6c599d4854e47ed88",
+    strip_prefix = "rules_boost-4ee400beca08f524e7ea3be3ca41cce34454272f",
+    urls = [
+        "https://github.com/nelhage/rules_boost/archive/4ee400beca08f524e7ea3be3ca41cce34454272f.tar.gz",
+    ],
 )
 
 load("@com_github_nelhage_rules_boost//:boost/boost.bzl", "boost_deps")
@@ -186,14 +188,6 @@ http_archive(
     sha256 = "3e9ab5b3844a8b65fc8152633aafe85f406e6da463e53921583dfc4a443ff03a",
     strip_prefix = "lksctp-tools-1.0.18",
     urls = ["https://github.com/sctp/lksctp-tools/archive/v1.0.18.tar.gz"],
-)
-
-http_archive(
-    name = "systemtap-sdt",
-    build_file = "//third_party:systemtap-sdt.BUILD",
-    sha256 = "0984ebe3162274988252ec35074021dc1e8420d87a8b35f437578562fce08781",
-    strip_prefix = "systemtap-4.2",
-    urls = ["https://sourceware.org/systemtap/ftp/releases/systemtap-4.2.tar.gz"],
 )
 
 http_archive(
@@ -316,3 +310,13 @@ http_archive(
     ],
 )
 
+http_archive(
+    name = "hugectr",
+    build_file = "//third_party:hugectr.BUILD",
+    strip_prefix = "HugeCTR-4.3",
+    patch_args = ["-p1"],
+    patches = ["//third_party:HugeCTR.patch"],
+    urls = [
+        "https://github.com/NVIDIA-Merlin/HugeCTR/archive/refs/tags/v4.3.tar.gz",
+    ],
+)

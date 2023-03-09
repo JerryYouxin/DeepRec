@@ -3222,7 +3222,7 @@ class RemoveStackStridedSliceSameAxis : public ArithmeticOptimizerStage {
 
     int end_index = -1;
     int64 end_value = 0;
-    for (int i = 0; i < slice_end_vec.size(); ++i) {
+    for (size_t i = 0; i < slice_end_vec.size(); ++i) {
       const int64 v = slice_end_vec[i];
       if (v != pack_output_shape.dim_size(i)) {
         if (end_index != -1) {
@@ -3311,6 +3311,149 @@ class RemoveStackStridedSliceSameAxis : public ArithmeticOptimizerStage {
   }
 };
 
+// Eliminates unnecessary copies during sparse embedding lookup operations.
+//
+// For non-partitioned variables, the `tf.nn.embedding_lookup_sparse()` function
+// generates code of the form:
+//
+//     embeddings = <a 2D Tensor>
+//     sparse_ids = <a tf.int64 SparseTensor>
+//     segment_ids = sparse_ids.indices[:, 0]
+//     ids, idx = tf.unique(sparse_ids.values)
+//     gathered_rows = tf.gather(params, ids)
+//     result = tf.sparse.segment_<combiner>(gathered_rows, idx, segment_ids)
+//
+// In this case, all of the work in `tf.unique()` and `tf.gather()`
+// can be avoided by passing the full embeddings to
+// `tf.sparse.segment_<combiner>()` and performing the same amount of
+// computation (but fewer copies and allocations) as follows:
+//
+//     embeddings = <a 2D Tensor>
+//     sparse_ids = <a tf.int64 SparseTensor>
+//     segment_ids = sparse_ids.indices[:, 0]
+//     result = tf.sparse.segment_<combiner>(
+//          embeddings, sparse_ids.values, segment_ids)
+class SimplifyEmbeddingLookupStage : public ArithmeticOptimizerStage {
+ public:
+  explicit SimplifyEmbeddingLookupStage(
+      const GraphOptimizerContext& ctx,
+      const ArithmeticOptimizerContext& ctx_ext)
+      : ArithmeticOptimizerStage("SimplifyEmbeddingLookupStage", ctx, ctx_ext) {
+  }
+  ~SimplifyEmbeddingLookupStage() override = default;
+
+  bool IsSupported(const NodeDef* node) const override {
+    return IsAnySparseSegmentReduction(*node);
+  }
+
+  Status TrySimplify(NodeDef* reduction_node,
+                     string* simplified_node_name) override {
+    if (IsInPreserveSet(*reduction_node)) return Status::OK();
+
+    // Input 0 (data) of the reduction node must be a tf.gather() on the 0th
+    // axis.
+    NodeDef* gather_node = nullptr;
+    TF_RETURN_IF_ERROR(GetInputNode(reduction_node->input(0), &gather_node));
+    if (!IsGather(*gather_node) || IsInPreserveSet(*gather_node) ||
+        gather_node->device() != reduction_node->device())
+      return Status::OK();
+    if (gather_node->op() == "GatherV2" && !IsAxis0(*gather_node, 2))
+      return Status::OK();
+
+    // Input 1 (indices) of the gather node must be a tf.unique() on the 0th
+    // axis.
+    NodeDef* unique_node = nullptr;
+    TF_RETURN_IF_ERROR(GetInputNode(gather_node->input(1), &unique_node));
+    if (!IsUnique(*unique_node) || IsInPreserveSet(*unique_node) ||
+        unique_node->device() != gather_node->device())
+      return Status::OK();
+    if (unique_node->op() == "UniqueV2" && !IsAxis0(*unique_node, 1))
+      return Status::OK();
+
+    DataType unique_element_type;
+    TF_RETURN_IF_ERROR(GetNodeAttr(*unique_node, "T", &unique_element_type));
+
+    // Input 1 (indices) of the reduction node must be output 1 of the unique
+    // node.
+    const TensorId idx_tensor = ParseTensorName(reduction_node->input(1));
+    if (idx_tensor != TensorId(unique_node->name(), 1)) return Status::OK();
+
+    // Input 1 (indices) of the reduction node becomes input 0 (x) of the unique
+    // node.
+    reduction_node->set_input(1, unique_node->input(0));
+    ctx().node_map->UpdateInput(reduction_node->name(),
+                                reduction_node->input(1),
+                                unique_node->input(0));
+    SetDataTypeToAttr(unique_element_type, "Tidx", reduction_node);
+
+    // Input 0 (data) of the reduction node becomes input 1 (params) of the
+    // gather node.
+    const OpInfo::TensorProperties* gather_input_properties;
+    TF_RETURN_IF_ERROR(
+        GetTensorProperties(gather_node->input(0), &gather_input_properties));
+    if (gather_input_properties->dtype() == DT_RESOURCE) {
+      // If the input is a ResourceGather, we need to add
+      // ReadVariableOp.
+      NodeDef* variable_node = nullptr;
+      TF_RETURN_IF_ERROR(GetInputNode(gather_node->input(0), &variable_node));
+      NodeDef* read_var_node = ctx().optimized_graph->add_node();
+      read_var_node->set_name(OptimizedNodeName(
+          ParseNodeScopeAndName(reduction_node->name()), "ReadVar"));
+      read_var_node->set_op("ReadVariableOp");
+      read_var_node->add_input(gather_node->input(0));
+      read_var_node->set_device(variable_node->device());
+
+      // The Variable and the Gather node should have the same
+      // dtype, but it might not be set on both nodes.
+      auto attr = read_var_node->mutable_attr();
+      if (variable_node->attr().count("dtype")) {
+        SetAttrValue(variable_node->attr().at("dtype").type(),
+                     &(*attr)["dtype"]);
+      }
+      if (gather_node->attr().count("dtype")) {
+        SetAttrValue(gather_node->attr().at("dtype").type(), &(*attr)["dtype"]);
+      }
+      // Copy the _class attr from the Gather node should it exist in case
+      // of location constraints with the variable.
+      if (gather_node->attr().count("_class")) {
+        (*attr)["_class"] = gather_node->attr().at("_class");
+      }
+      if (variable_node->attr().count("shape")) {
+        SetAttrValue(variable_node->attr().at("shape").shape(),
+                     &(*attr)["_output_shapes"]);
+      }
+
+      ctx().node_map->AddNode(read_var_node->name(), read_var_node);
+      reduction_node->set_input(0, read_var_node->name());
+      ctx().node_map->UpdateInput(reduction_node->name(),
+                                  reduction_node->input(0),
+                                  read_var_node->name());
+    } else {
+      reduction_node->set_input(0, gather_node->input(0));
+      ctx().node_map->UpdateInput(reduction_node->name(),
+                                  reduction_node->input(0),
+                                  gather_node->input(0));
+    }
+    *simplified_node_name = reduction_node->name();
+    return Status::OK();
+  }
+
+ private:
+  bool IsAxis0(const NodeDef& node, int axis_input) {
+    Tensor axis_tensor;
+    if (!GetTensorFromConstNode(node.input(axis_input), &axis_tensor))
+      return false;
+    if (axis_tensor.NumElements() != 1) return false;
+    if (axis_tensor.dtype() == DT_INT32) {
+      return axis_tensor.flat<int32>()(0) == 0;
+    } else if (axis_tensor.dtype() == DT_INT64) {
+      return axis_tensor.flat<int64>()(0) == 0;
+    } else {
+      return false;
+    }
+  }
+};
+
 }  // namespace
 
 class UniqueNodes {
@@ -3345,9 +3488,13 @@ class UniqueNodes {
  private:
   uint64 ComputeSignature(const NodeDef& node);
   bool SameNode(const NodeDef& node1, const NodeDef& node2) const;
+  bool IsExcludeAttribute(const std::string& attr_name) const;
 
   absl::flat_hash_map<uint64, std::vector<NodeDef*>> rep_;
   absl::flat_hash_map<const NodeDef*, uint64> memoized_signatures_;
+  std::unordered_set<std::string> exclude_attrs_ = {
+    "_stream_id"
+  };
 };
 
 uint64 UniqueNodes::ComputeSignature(const NodeDef& node) {
@@ -3364,6 +3511,9 @@ uint64 UniqueNodes::ComputeSignature(const NodeDef& node) {
     h = Hash64CombineUnordered(std::hash<int>()(input_tensor.index()), h);
   }
   for (const auto& attr : node.attr()) {
+    // exclue 'stream_id' attribute
+    if (IsExcludeAttribute(attr.first))
+      continue;
     h = Hash64CombineUnordered(Hash64(attr.first), h);
     h = Hash64CombineUnordered(FastAttrValueHash(attr.second), h);
   }
@@ -3384,7 +3534,21 @@ bool UniqueNodes::SameNode(const NodeDef& node1, const NodeDef& node2) const {
   if (node1.input_size() != node2.input_size()) {
     return false;
   }
-  if (node1.attr_size() != node2.attr_size()) {
+
+  int node1_attr_size = node1.attr_size();
+  int node2_attr_size = node2.attr_size();
+  // exclude 'stream_id' attribute
+  for (const auto& attr : node1.attr()) {
+    if (IsExcludeAttribute(attr.first)) {
+      node1_attr_size -= 1;
+    }
+  }
+  for (const auto& attr : node2.attr()) {
+    if (IsExcludeAttribute(attr.first)) {
+      node2_attr_size -= 1;
+    }
+  }
+  if (node1_attr_size != node2_attr_size) {
     return false;
   }
 
@@ -3397,12 +3561,22 @@ bool UniqueNodes::SameNode(const NodeDef& node1, const NodeDef& node2) const {
 
   // Compare attributes.
   for (const auto& attr1 : node1.attr()) {
+    // exclude 'stream_id' attribute
+    if (IsExcludeAttribute(attr1.first))
+      continue;
     auto it = node2.attr().find(attr1.first);
     if (it == node2.attr().end()) return false;
     if (!FastAreAttrValuesEqual(attr1.second, it->second)) return false;
   }
 
   return true;
+}
+
+bool UniqueNodes::IsExcludeAttribute(const std::string& attr_name) const {
+  if (exclude_attrs_.find(attr_name) != exclude_attrs_.end())
+    return true;
+
+  return false;
 }
 
 bool ArithmeticOptimizer::CanDedup(const NodeDef& node) const {
@@ -3591,6 +3765,8 @@ Status ArithmeticOptimizer::SimplifyArithmeticOps(bool can_use_shapes) {
     pipeline.AddStage<RemoveStackStridedSliceSameAxis>(ctx, ctx_ext);
   if (options_.fuse_squared_diff)
     pipeline.AddStage<FuseSquaredDiffStage>(ctx, ctx_ext);
+  if (options_.simplify_embedding_lookup)
+    pipeline.AddStage<SimplifyEmbeddingLookupStage>(ctx, ctx_ext);
 
   VLOG(1) << "Run " << pipeline.NumStages() << " arithmetic optimizer stages: "
           << absl::StrJoin(pipeline.StageNames(), ", ");

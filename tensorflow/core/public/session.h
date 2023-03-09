@@ -275,9 +275,10 @@ class SessionGroup {
   virtual ~SessionGroup() {}
   virtual Status Close() = 0;
   virtual int32_t GetSessionNum() const = 0;
+  virtual Status CreateSession(Session* session) = 0;
   virtual Status CreateLeaderSession(Session* leader_session) = 0;
   virtual Status CreateFollowerSession(Session* follower_session) = 0;
-  virtual Session* GetLeaderSession() = 0;
+  virtual std::vector<Session*> GetLeaderSessions() = 0;
   virtual Status Create(const GraphDef& graph) = 0;
   virtual Status Run(
       const std::vector<std::pair<string, Tensor> >& inputs,
@@ -305,7 +306,7 @@ Status NewSession(const SessionOptions& options, Session** out_session);
 
 Status NewSessionGroup(const SessionOptions& options,
                        SessionGroup** out_session_group,
-                       int session_num = 1);
+                       const SessionGroupMetadata& metadata);
 
 /// \brief Resets resource containers associated with a target.
 ///

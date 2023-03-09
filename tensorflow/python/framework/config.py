@@ -21,7 +21,7 @@ from __future__ import print_function
 from tensorflow.python.eager import context
 from tensorflow.python import _pywrap_tensor_float_32_execution
 from tensorflow.python.util.tf_export import tf_export
-
+from tensorflow.python.framework import group_embedding_ops_utils
 
 @tf_export('config.experimental.tensor_float_32_execution_enabled')
 def tensor_float_32_execution_enabled():
@@ -621,3 +621,36 @@ def set_virtual_device_configuration(device, virtual_devices):
     virtual_devices: (optional) Need to update
   """
   context.context().set_virtual_device_configuration(device, virtual_devices)
+
+@tf_export('config.experimental.enable_distributed_strategy')
+def enable_distributed_strategy(strategy="collective"):
+  """Initialize required env for Fuison embedding lookup
+
+  This function will enable group embedding lookup module in later
+  framework execution.
+
+  The following example demonstrates the useage of this interface
+  ```
+  tf.config.experimental.enable_distributed_strategy(strategy="collective")
+  ```
+  """
+  if strategy == "collective":
+    try:
+      import horovod.tensorflow as hvd
+      hvd.init()
+    except:
+      raise ImportError("While param `strategy` in enable_distributed_strategy"
+                        "is given `collective`, horovod module initialize error,"
+                        "please double check")
+     
+    try:
+      from sparse_operation_kit import experiment as sok
+      sok.init()
+      group_embedding_ops_utils.set_group_lookup_strategy(strategy)
+    except:
+      raise ImportError("While param `strategy` in enable_distributed_strategy"
+                        "is given `collective`, sok module initialize error,"
+                        "please double check")
+  else:
+    raise ValueError("param `strategy` is given {}, Currently only support \
+                     `collective`".format(strategy))

@@ -1,4 +1,5 @@
 #include <fstream>
+#include "serving/processor/serving/message_coding.h"
 #include "serving/processor/serving/model_instance.h"
 #include "serving/processor/serving/model_partition.h"
 #include "serving/processor/serving/model_session.h"
@@ -24,6 +25,7 @@ namespace processor {
 namespace {
 constexpr int _60_Seconds = 60;
 constexpr int MAX_TRY_COUNT = 10;
+constexpr int WARMUP_COUNT = 5;
 
 Tensor CreateTensor(const TensorInfo& tensor_info) {
   auto real_ts = tensor_info.tensor_shape();
@@ -71,44 +73,35 @@ Tensor CreateTensor(const TensorInfo& tensor_info) {
   return tensor;
 }
 
-Call CreateWarmupParams(SignatureDef& sig_def) {
-  Call call;
+Status CreateWarmupParams(SignatureDef& sig_def, Call* call) {
   for (auto it : sig_def.inputs()) {
     const auto& tensor = CreateTensor(it.second);
-    call.request.inputs.emplace_back(it.second.name(), tensor);
+    call->request.inputs.emplace_back(it.second.name(), tensor);
   }
 
   for (auto it : sig_def.outputs()) {
-    call.request.output_tensor_names.emplace_back(it.second.name());
+    call->request.output_tensor_names.emplace_back(it.second.name());
   }
 
-  return call; 
+  return Status::OK();
 }
 
-Call CreateWarmupParams(SignatureDef& sig_def,
-                        const std::string& warmup_file_name) {
+Status CreateWarmupParams(SignatureDef& sig_def,
+                          const std::string& warmup_file_name,
+                          Call* call, IParser* parser,
+                          const SignatureInfo& signature_info) {
   // Parse warmup file
   eas::PredictRequest request;
   std::fstream input(warmup_file_name, std::ios::in | std::ios::binary);
-  request.ParseFromIstream(&input);
+  bool success = request.ParseFromIstream(&input);
+  if (!success) {
+    LOG(ERROR) << "Read warmp file failed: " << warmup_file_name;
+    return Status(error::Code::INTERNAL,
+        "Read warmp file failed, please check warmp file path");
+  }
   input.close();
 
-  Call call;
-  for (auto& input : request.inputs()) {
-    call.request.inputs.emplace_back(input.first,
-        util::Proto2Tensor(input.second));
-  }
-
-  call.request.output_tensor_names =
-      std::vector<std::string>(request.output_filter().begin(),
-                               request.output_filter().end());
-
-  // User need to set fetches
-  if (call.request.output_tensor_names.size() == 0) {
-    LOG(FATAL) << "warmup file must be contain fetches.";
-  }
-
-  return call; 
+  return parser->ParseRequest(request, &signature_info, *call);
 }
 
 bool ShouldWarmup(SignatureDef& sig_def) {
@@ -264,6 +257,7 @@ Status LocalSessionInstance::Init(ModelConfig* config,
         {kSavedModelTagServe}, &meta_graph_def_));
 
   warmup_file_name_ = config->warmup_file_name;
+  parser_ = ParserFactory::GetInstance(config->serialize_protocol, 4);
 
   GraphOptimizerOption option;
   option.native_tf_mode = true;
@@ -289,19 +283,21 @@ Status LocalSessionInstance::Init(ModelConfig* config,
       session_options_, run_options_);
 
   if (config->enable_incr_model_update) {
-    return LoadModelFromCheckpoint(config);
+    return LoadModelFromCheckpoint(config, true);
   } else {
     return LoadSavedModel(config);
   }
 }
 
 Status LocalSessionInstance::LoadModelFromCheckpoint(
-    ModelConfig* config) {
+    ModelConfig* config, bool is_initialize) {
   // Load full model
   TF_RETURN_IF_ERROR(session_mgr_->CreateModelSession(version_,
       version_.full_ckpt_name.c_str(),
       version_.delta_ckpt_name.c_str(),
-      /*is_incr_ckpt*/false, config));
+      /*is_incr_ckpt*/false,
+      /*is_initialize*/is_initialize,
+      config));
 
   // Load delta model if existed
   if (version_.delta_ckpt_name.empty()) {
@@ -311,7 +307,9 @@ Status LocalSessionInstance::LoadModelFromCheckpoint(
   return session_mgr_->CreateModelSession(version_,
       version_.full_ckpt_name.c_str(),
       version_.delta_ckpt_name.c_str(),
-      /*is_incr_ckpt*/true, config);
+      /*is_incr_ckpt*/true,
+      /*is_initialize*/is_initialize,
+      config);
 }
 
 Status LocalSessionInstance::LoadSavedModel(
@@ -352,21 +350,38 @@ Status LocalSessionInstance::Warmup(
     return Status::OK();
   }
 
+  LOG(INFO) << "Try to warmup model: " << warmup_file_name_;
+  Status s;
   Call call;
   if (warmup_file_name_.empty()) {
-    call = CreateWarmupParams(model_signature_.second);
+    s = CreateWarmupParams(model_signature_.second, &call);
   } else {
-    call = CreateWarmupParams(model_signature_.second,
-                              warmup_file_name_);
+    s = CreateWarmupParams(model_signature_.second,
+                           warmup_file_name_, &call,
+                           parser_, signature_info_);
+  }
+  if (!s.ok()) {
+    LOG(ERROR) << "Create warmup params failed, warmup will be canceled.";
+    return s;
   }
 
-  if (warmup_session) {
-    return warmup_session->LocalPredict(
-        call.request, call.response);
-  }
+  int left_try_count = WARMUP_COUNT;
+  while (left_try_count > 0) {
+    if (warmup_session) {
+      s = warmup_session->Warmup(
+          call.request, call.response);
+    } else {
+      s = session_mgr_->Warmup(
+          call.request, call.response);
+    }
+    if (!s.ok()) return s;
 
-  return session_mgr_->LocalPredict(
-      call.request, call.response);
+    --left_try_count;
+    call.response.outputs.clear();
+  }
+  LOG(INFO) << "Warmup model successful: " << warmup_file_name_;
+
+  return Status::OK();
 }
 
 std::string LocalSessionInstance::DebugString() {
@@ -389,7 +404,9 @@ Status LocalSessionInstance::FullModelUpdate(
       session_mgr_->CreateModelSession(version,
           version.full_ckpt_name.c_str(),
           version.delta_ckpt_name.c_str(),
-          /*is_incr_ckpt*/false, model_config,
+          /*is_incr_ckpt*/false,
+          /*is_initialize*/false,
+          model_config,
           &new_model_session));
 
   // warmup model
@@ -407,7 +424,9 @@ Status LocalSessionInstance::DeltaModelUpdate(
       session_mgr_->CreateModelSession(version,
           version.full_ckpt_name.c_str(),
           version.delta_ckpt_name.c_str(),
-          /*is_incr_ckpt*/true, model_config));
+          /*is_incr_ckpt*/true,
+          /*is_initialize*/false,
+          model_config));
 
   // Delta model update: No need to warmup model and
   // reset serving session, we don't create a new session.
@@ -474,6 +493,7 @@ Status RemoteSessionInstance::Init(ModelConfig* model_config,
   backup_storage_ = new FeatureStoreMgr(&backup_model_config);
 
   warmup_file_name_ = model_config->warmup_file_name;
+  parser_ = ParserFactory::GetInstance(model_config->serialize_protocol, 4);
 
   // set active flag
   serving_storage_->SetStorageActiveStatus(active);
@@ -534,21 +554,36 @@ Status RemoteSessionInstance::Warmup(
     return Status::OK();
   }
 
+  Status s;
   Call call;
   if (warmup_file_name_.empty()) {
-    call = CreateWarmupParams(model_signature_.second);
+    s = CreateWarmupParams(model_signature_.second, &call);
   } else {
-    call = CreateWarmupParams(model_signature_.second,
-                              warmup_file_name_);
+    s = CreateWarmupParams(model_signature_.second,
+                           warmup_file_name_, &call,
+                           parser_, signature_info_);
+  }
+  if (!s.ok()) {
+    LOG(ERROR) << "Create warmup params failed, warmup will be canceled.";
+    return s;
   }
 
-  if (warmup_session) {
-    return warmup_session->Predict(
-        call.request, call.response);
+  int left_try_count = WARMUP_COUNT;
+  while (left_try_count > 0) {
+    if (warmup_session) {
+      s = warmup_session->Warmup(
+          call.request, call.response, false);
+    } else {
+      s = session_mgr_->Warmup(
+          call.request, call.response, false);
+    }
+    if (!s.ok()) return s;
+
+    --left_try_count;
+    call.response.outputs.clear();
   }
 
-  return session_mgr_->Predict(
-      call.request, call.response);
+  return Status::OK();
 }
 
 Status RemoteSessionInstance::FullModelUpdate(
@@ -610,6 +645,7 @@ LocalSessionInstanceMgr::LocalSessionInstanceMgr(ModelConfig* config)
   session_options_->config.set_inter_op_parallelism_threads(config->inter_threads);
   session_options_->config.set_intra_op_parallelism_threads(config->intra_threads);
   session_options_->config.set_use_per_session_threads(config->use_per_session_threads);
+  session_options_->config.set_use_per_session_stream(config->use_multi_stream);
   //session_options_->config.mutable_gpu_options()->set_allocator_type("CPU");
   run_options_ = new RunOptions();
 }

@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/common_runtime/direct_session.h"
+#include "tensorflow/core/common_runtime/custom_thread_pool.h"
 
 #include <atomic>
 #include <string>
@@ -57,6 +58,7 @@ limitations under the License.
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/graph_partition.h"
+#include "tensorflow/core/graph/stream_subgraph.h"
 #include "tensorflow/core/graph/subgraph.h"
 #include "tensorflow/core/graph/tensor_id.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -83,6 +85,10 @@ limitations under the License.
 #include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/util/device_name_utils.h"
 #include "tensorflow/core/util/env_var.h"
+#if GOOGLE_CUDA
+#include "tensorflow/core/common_runtime/gpu/gpu_init.h"
+#include "tensorflow/stream_executor/platform.h"
+#endif
 
 namespace tensorflow {
 
@@ -140,6 +146,25 @@ Status NewThreadPoolFromThreadPoolOptions(
   *owned = false;
   *pool = mvalue->second;
   return Status::OK();
+}
+
+void NewStageSubGraphThreadPoolFromStageSubGraphThreadPoolOptions(
+    const SessionOptions& sess_options,
+    const StageSubGraphThreadPoolOptionsProto& thread_pool_options,
+    const int pool_number,
+    std::pair<thread::ThreadPoolInterface *, thread::ThreadPoolInterface *>& pool) {  
+  const std::string name_prefix =
+      thread_pool_options.global_name() + "_" + std::to_string(pool_number);
+
+  auto stage_subgraph_inter_op_thread_pool =
+      new CustomThreadPoolImpl(strings::StrCat(name_prefix, "_inter"),
+                               thread_pool_options.inter_op_threads_num());  
+  auto stage_subgraph_intra_op_thread_pool =
+      new CustomThreadPoolImpl(strings::StrCat(name_prefix, "_intra"),
+			       thread_pool_options.intra_op_threads_num());  
+
+  pool.first = stage_subgraph_inter_op_thread_pool;
+  pool.second = stage_subgraph_intra_op_thread_pool; 
 }
 
 thread::ThreadPool* GlobalThreadPool(const SessionOptions& options) {
@@ -211,6 +236,28 @@ void ParseSessionGroupCpuset(const std::string& session_group_cpuset,
   }
 }
 
+int VisibleDeviceCount(const string& visible_device_list) {
+#if GOOGLE_CUDA
+  if (visible_device_list.empty()) {
+    return GPUMachineManager()->VisibleDeviceCount();
+  }
+
+  const std::vector<string> order_str =
+      str_util::Split(visible_device_list, ',');
+  return order_str.size();
+#else
+  return 0;
+#endif
+}
+
+int VisibleDeviceCount() {
+#if GOOGLE_CUDA
+  return GPUMachineManager()->VisibleDeviceCount();
+#else
+  return 0;
+#endif
+}
+
 }  // namespace
 
 class DirectSessionFactory : public SessionFactory {
@@ -245,13 +292,60 @@ class DirectSessionFactory : public SessionFactory {
       EnableCPUAllocatorFullStats(true);
     }
     std::vector<std::unique_ptr<Device>> devices;
-    TF_RETURN_IF_ERROR(DeviceFactory::AddDevices(
-        options, "/job:localhost/replica:0/task:0", &devices));
+    // use multi-stream
+    auto rewrite_config =
+        options.config.graph_options().rewrite_options();
+    ResourceMgr* gpu_shared_rmgr = nullptr;
+    if (rewrite_config.use_multi_stream() == RewriterConfig::ON) {
+#if GOOGLE_CUDA
+      int multi_streams_num =
+          rewrite_config.multi_stream_opts().multi_stream_num();
+      ConfigProto* config = const_cast<ConfigProto*>(&options.config);
+      GPUOptions* gpu_options = config->mutable_gpu_options();
+      auto virtual_devices =
+          gpu_options->mutable_experimental()->add_virtual_devices();
+      // will allocate gpu memory for each virtual device later.
+      int32 mem_per_virtual_device = -1;
+      for (int i = 0; i < multi_streams_num; ++i) {
+        virtual_devices->add_memory_limit_mb(-1);
+      }
+
+      // We set allow_growth in multi-stream mode.
+      gpu_options->set_allow_growth(true);
+
+      // Create shared resource for gpu devices
+      DeviceResourceMgrMap dev_rmgr_map;
+      gpu_shared_rmgr = new ResourceMgr("localhost");
+      std::string gpu_dev_prefix("/job:localhost/replica:0/task:0/device:GPU:");
+      for (int i = 0; i < multi_streams_num; ++i) {
+        dev_rmgr_map.device_rmgr_map[gpu_dev_prefix+std::to_string(i)] =
+            gpu_shared_rmgr;
+      }
+
+      DeviceGlobalThreadPoolOptions dev_global_tp_opt;
+      TF_RETURN_IF_ERROR(DeviceFactory::AddDevices(
+          options, "/job:localhost/replica:0/task:0",
+          &devices, &dev_rmgr_map, dev_global_tp_opt));
+#endif
+    } else {
+      TF_RETURN_IF_ERROR(DeviceFactory::AddDevices(
+          options, "/job:localhost/replica:0/task:0", &devices));
+    }
 
     std::vector<unsigned> visible_cpus;
     DirectSession* session =
         new DirectSession(options, new DeviceMgr(std::move(devices)),
                           true, this, visible_cpus);
+
+#if GOOGLE_CUDA
+    // owned gpu_shared_rmgr
+    if (rewrite_config.use_multi_stream() == RewriterConfig::ON) {
+      session->SetMultiStreamInfo(
+          rewrite_config.multi_stream_opts().multi_stream_num(),
+          gpu_shared_rmgr);
+    }
+#endif
+
     {
       mutex_lock l(sessions_lock_);
       sessions_.push_back(session);
@@ -262,7 +356,8 @@ class DirectSessionFactory : public SessionFactory {
 
   Status NewSessionGroup(const SessionOptions& options,
                          SessionGroup** out_session_group,
-                         int session_num = 1) {
+                         const SessionGroupMetadata& metadata) {
+    int session_num = metadata.session_count;
     if (session_num < 1) {
       return errors::InvalidArgument(
           "Must specify session_num of NewSessionGroup");
@@ -294,17 +389,69 @@ class DirectSessionFactory : public SessionFactory {
     // Each virtual gpu device will be assigned to one session,
     // and every virtual device has a independent stream.
     bool use_multi_stream = options.config.use_per_session_stream();
+    int base_index = 0;
+    std::vector<size_t> sorted_gpu_ids;
+    // Visiable gpu ids: 0,1,2...
+    int visible_gpu_count = VisibleDeviceCount();
+    int stream_num_per_device = session_num;
     if (use_multi_stream) {
-      int multi_streams_num = session_num;
+      // Current model id in multi-models
+      int model_id = metadata.model_id;
+      // If user not set gpu id list, session group will
+      // use all visiable gpus.
+      auto user_set_gpu_ids = metadata.gpu_ids;
+      if (user_set_gpu_ids.empty()) {
+        LOG(WARNING) << "User not set gpu id list for session_group, "
+                     << "default we will use all visiable gpus.";
+        user_set_gpu_ids.resize(visible_gpu_count);
+        int idx = 0;
+        std::generate(user_set_gpu_ids.begin(), user_set_gpu_ids.end(),
+                      [&idx] { return idx++; });
+      } else {
+        for (auto gpu_id : user_set_gpu_ids) {
+          if (gpu_id >= visible_gpu_count) {
+            std::string debug_ids("");
+            for (int i = 0; i < visible_gpu_count; ++i) {
+              debug_ids += std::to_string(i);
+              debug_ids += ",";
+            }
+            LOG(FATAL) << "Invalid gpu id " << gpu_id
+                       << ", visiable gpu ids: " << debug_ids;
+          }
+        }
+      }
+
+      sorted_gpu_ids = user_set_gpu_ids;
+      std::sort(sorted_gpu_ids.begin(), sorted_gpu_ids.end());
       ConfigProto* config = const_cast<ConfigProto*>(&options.config);
       GPUOptions* gpu_options = config->mutable_gpu_options();
-      auto virtual_devices =
-          gpu_options->mutable_experimental()->add_virtual_devices();
-      // will allocate gpu memory for each virtual device later.
-      int32 mem_per_virtual_device = -1;
-      for (int i = 0; i < multi_streams_num; ++i) {
-        virtual_devices->add_memory_limit_mb(-1);
+      int curr_idx = 0;
+      for (int id = 0; id < visible_gpu_count; ++id) {
+        auto virtual_devices =
+            gpu_options->mutable_experimental()->add_virtual_devices();
+        if (id == sorted_gpu_ids[curr_idx]) {
+          ++curr_idx;
+          for (int i = 0; i < stream_num_per_device; ++i) {
+            virtual_devices->add_memory_limit_mb(-1);
+          }
+        } else {
+          virtual_devices->add_memory_limit_mb(-1);
+        }
       }
+      if (curr_idx != sorted_gpu_ids.size()) {
+        std::string debug_ids("");
+        for (auto id : sorted_gpu_ids) {
+          debug_ids += std::to_string(id);
+          debug_ids += ",";
+        }
+        LOG(FATAL) << "Invalid gpu ids, curr_idx=" << curr_idx
+                   << ", sorted_gpu_ids size=" << sorted_gpu_ids.size()
+                   << ", visible_gpu_count=" << visible_gpu_count
+                   << ", user set gpu ids is " << debug_ids;
+      }
+
+      // total session count
+      session_num = stream_num_per_device * user_set_gpu_ids.size();
 
       // We set allow_growth in multi-stream mode.
       gpu_options->set_allow_growth(true);
@@ -323,11 +470,14 @@ class DirectSessionFactory : public SessionFactory {
     // User set session group cpuset,
     // Usage: "0-10;11-20;21-30" or
     //        "0,1,2,3;4,5,6,7;8,9,10"
-    std::string session_group_cpuset("");
-    Status s =
-        ReadStringFromEnvVar("SESSION_GROUP_CPUSET", "", &session_group_cpuset);
-    if (!s.ok()) {
-      LOG(FATAL) << "Read SESSION_GROUP_CPUSET failed." << s.error_message();
+    std::string session_group_cpuset = metadata.cpusets;
+    Status s;
+    if (session_group_cpuset.empty()) {
+      s = ReadStringFromEnvVar("SESSION_GROUP_CPUSET",
+                               "", &session_group_cpuset);
+      if (!s.ok()) {
+        LOG(ERROR) << "Read SESSION_GROUP_CPUSET failed." << s.error_message();
+      }
     }
     if (!session_group_cpuset.empty()) {
       std::vector<std::vector<unsigned> > tmp;
@@ -366,50 +516,62 @@ class DirectSessionFactory : public SessionFactory {
     dev_rmgr_map.device_rmgr_map["/device:CPU:0"] = shared_rmgr;
     dev_rmgr_map.device_rmgr_map["/device:cpu:0"] = shared_rmgr;
 
-    ResourceMgr* gpu_shared_rmgr = nullptr;
+    std::vector<ResourceMgr*> gpu_shared_rmgrs;
 #if GOOGLE_CUDA
-    if (use_multi_stream) {
-      // Create shared resource for gpu devices
-      gpu_shared_rmgr = new ResourceMgr("localhost");
+    bool use_per_session_host_allocator = false;
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator));
+    int curr_idx = 0;
+    int dev_id = 0;
+    int curr_session_id = 0;
+    // hold virtual_gpu_id for each session
+    std::vector<int> session_to_device_id;
+    for (int id = 0; id < visible_gpu_count; ++id) {
       std::string gpu_dev_prefix("/job:localhost/replica:0/task:0/device:GPU:");
-      for (int i = 0; i < session_num; ++i) {
-        dev_rmgr_map.device_rmgr_map[gpu_dev_prefix+std::to_string(i)] =
-            gpu_shared_rmgr;
+      // current session group use #id gpu.
+      if (id == sorted_gpu_ids[curr_idx]) {
+        // each gpu will create stream_num_per_device virtual devices.
+        // virtual devices on the same physical gpu will share gpu ResourceMgr.
+        ResourceMgr* gpu_shared_rmgr = new ResourceMgr("localhost");
+        gpu_shared_rmgrs.emplace_back(gpu_shared_rmgr);
+        for (int i = 0; i < stream_num_per_device; ++i) {
+          dev_rmgr_map.device_rmgr_map[gpu_dev_prefix+std::to_string(dev_id)] =
+              gpu_shared_rmgr;
+          // gpu host allocator
+          if (use_per_session_host_allocator) {
+            std::string sid = std::to_string(curr_session_id);
+            dev_rmgr_map.device_rmgr_map[dev_prefix+"/device:CPU:"+sid] = shared_rmgr;
+            dev_rmgr_map.device_rmgr_map[dev_prefix+"/device:cpu:"+sid] = shared_rmgr;
+            dev_rmgr_map.device_rmgr_map["/device:CPU:"+sid] = shared_rmgr;
+            dev_rmgr_map.device_rmgr_map["/device:cpu:"+sid] = shared_rmgr;
+          }
+          session_to_device_id.emplace_back(dev_id);
+          ++dev_id;
+          ++curr_session_id;
+        }
+        ++curr_idx;
+      } else {
+        // placeholder for non-used gpu.
+        // please check virtual devices setting above.
+        ++dev_id;
       }
     }
-#endif // GOOGLE_CUDA
+#endif
+
+
+#if GOOGLE_CUDA
+    SessionGroup* session_group =
+      new DirectSessionGroup(shared_rmgr, gpu_shared_rmgrs,
+          session_num, stream_num_per_device);
+#else
+    SessionGroup* session_group =
+      new DirectSessionGroup(shared_rmgr, nullptr);
+#endif
 
     DeviceGlobalThreadPoolOptions dev_global_tp_opt;
     dev_global_tp_opt.global_threadpool_num = session_num;
-    dev_global_tp_opt.device_threadpool_index = 0;
-    dev_global_tp_opt.cpuset = visible_cpus_per_session[0];
-    std::vector<std::unique_ptr<Device>> devices;
-    TF_RETURN_IF_ERROR(DeviceFactory::AddDevices(
-        options, "/job:localhost/replica:0/task:0",
-        &devices, &dev_rmgr_map, dev_global_tp_opt));
-
-#if GOOGLE_CUDA
-    if (use_multi_stream) {
-      RemoveUselessDevice(devices, 0);
-    }
-#endif // GOOGLE_CUDA
-    DeviceMgr* device_mgr = new DeviceMgr(std::move(devices));
-
-    SessionGroup* session_group =
-        new DirectSessionGroup(shared_rmgr, gpu_shared_rmgr);
-    SessionOptions leader_options = options;
-#if GOOGLE_CUDA
-    if (use_multi_stream) {
-      leader_options.config.add_per_session_devices(
-          "/job:localhost/replica:0/task:0/device:GPU:0");
-    }
-#endif // GOOGLE_CUDA
-
-    DirectSession* leader_session =
-        new DirectSession(leader_options, device_mgr, true, this,
-                          visible_cpus_per_session[0]);
-    session_group->CreateLeaderSession(leader_session);
-    for (int i = 1; i < session_num; ++i) {
+    for (int i = 0; i < session_num; ++i) {
       dev_global_tp_opt.device_threadpool_index = i;
       dev_global_tp_opt.cpuset = visible_cpus_per_session[i];
       std::vector<std::unique_ptr<Device>> dev;
@@ -417,41 +579,55 @@ class DirectSessionFactory : public SessionFactory {
           options, "/job:localhost/replica:0/task:0", &dev,
           &dev_rmgr_map, dev_global_tp_opt));
       DeviceMgr* dev_mgr = nullptr;
+      bool owned_device_mgr = true;
 #if GOOGLE_CUDA
       if (use_multi_stream) {
-        RemoveUselessDevice(dev, i);
+        RemoveUselessDevice(dev, session_to_device_id[i]);
         dev_mgr = new DeviceMgr(std::move(dev));
+        owned_device_mgr = true;
       } else {
         // Use the same deivce as leader session, this can't get
         // good performance, so user should set use_multi_stream true
         // in session group mode.
+        static DeviceMgr* device_mgr = new DeviceMgr(std::move(dev));
         dev_mgr = device_mgr;
+        owned_device_mgr = false;
       }
 #else
       dev_mgr = new DeviceMgr(std::move(dev));
+      owned_device_mgr = true;
 #endif // GOOGLE_CUDA
 
-      SessionOptions follower_options = options;
+      SessionOptions curr_options = options;
 #if GOOGLE_CUDA
       if (use_multi_stream) {
-        follower_options.config.add_per_session_devices(
-            "/job:localhost/replica:0/task:0/device:GPU:"+std::to_string(i));
+        curr_options.config.add_per_session_devices(
+            "/job:localhost/replica:0/task:0/device:GPU:" +
+            std::to_string(session_to_device_id[i]));
+        if (use_per_session_host_allocator) {
+          curr_options.config.add_per_session_devices(
+              "/job:localhost/replica:0/task:0/device:CPU:"+std::to_string(i));
+        } else {
+          curr_options.config.add_per_session_devices(
+              "/job:localhost/replica:0/task:0/device:CPU:0");
+        }
       }
 #endif // GOOGLE_CUDA
 
-      DirectSession* follower_session =
-          new DirectSession(follower_options, dev_mgr, true, this,
-                            visible_cpus_per_session[i]);
-      session_group->CreateFollowerSession(follower_session);
+      DirectSession* sess =
+          new DirectSession(curr_options, dev_mgr, owned_device_mgr,
+                            this, visible_cpus_per_session[i]);
+      session_group->CreateSession(sess);
       {
         mutex_lock l(sessions_lock_);
-        sessions_.push_back(follower_session);
+        sessions_.push_back(sess);
       }
     }
 
     {
       mutex_lock l(sessions_lock_);
-      sessions_.push_back(leader_session);
+      // keep leader session after follower session.
+      std::reverse(sessions_.begin(), sessions_.end());
     }
     *out_session_group = session_group;
 
@@ -589,7 +765,9 @@ DirectSession::DirectSession(const SessionOptions& options,
       device_mgr_(device_mgr),
       factory_(factory),
       cancellation_manager_(new CancellationManager()),
-      operation_timeout_in_ms_(options_.config.operation_timeout_in_ms()) {
+      operation_timeout_in_ms_(options_.config.operation_timeout_in_ms()),
+      use_multi_stream_(false), multi_stream_num_(0),
+      multi_stream_shared_rmgr_(nullptr) {
   const int thread_pool_size =
       options_.config.session_inter_op_thread_pool_size();
   if (thread_pool_size > 0) {
@@ -615,6 +793,17 @@ DirectSession::DirectSession(const SessionOptions& options,
       run_in_caller_thread_ = true;
     }
     MemoryPlannerFactory::GetMemoryPlanner()->SetThreadPool(GlobalThreadPool(options));
+  }
+
+  const int stage_subgraph_thread_pool_size =
+    options_.config.session_stage_subgraph_thread_pool_size();
+  for (int i = 0; i < stage_subgraph_thread_pool_size; ++i) {
+    std::pair<thread::ThreadPoolInterface*, thread::ThreadPoolInterface*>
+        pool_interface;
+    NewStageSubGraphThreadPoolFromStageSubGraphThreadPoolOptions(
+        options_, options_.config.session_stage_subgraph_thread_pool(i), i,
+        pool_interface);    
+    stage_subgraph_thread_pools_.emplace_back(pool_interface);    
   }
 
   bool use_cost_model_executor = false;
@@ -690,6 +879,10 @@ DirectSession::DirectSession(const SessionOptions& options,
     LOG(INFO) << "Current DirectSession " << this << " will be pinned to core: " << msg;
     thread_pools_[0].first->SetThreadPoolAffinity(cpuset);
   }
+
+  tensorflow::ReadBoolFromEnvVar("MERGE_COMPUTE_COPY_STREAM",
+                                 /*default_val=*/false,
+                                 &merge_compute_and_copy_stream_);
 }
 
 DirectSession::~DirectSession() {
@@ -709,12 +902,21 @@ DirectSession::~DirectSession() {
   for (const auto& p_and_owned : thread_pools_) {
     if (p_and_owned.second) delete p_and_owned.first;
   }
+  
+  for (const auto& p_inter_and_intra : stage_subgraph_thread_pools_) {
+    delete p_inter_and_intra.first;
+    delete p_inter_and_intra.second;
+  }
 
   execution_state_.reset(nullptr);
   flib_def_.reset(nullptr);
 
   if (own_device_mgr_) {
     delete device_mgr_;
+  }
+
+  if (multi_stream_shared_rmgr_) {
+    delete multi_stream_shared_rmgr_;
   }
 }
 
@@ -876,8 +1078,16 @@ Status DirectSession::RunInternal(
 
   // Start parallel Executors.
   const size_t num_executors = executors_and_keys->items.size();
+  // ref_send_inputs will be filled during execute graph.
+  std::vector<std::unique_ptr<TensorReference>> ref_send_inputs;
   ExecutorBarrier* barrier = new ExecutorBarrier(
-      num_executors, run_state.rendez, [&run_state](const Status& ret) {
+      num_executors, run_state.rendez,
+      [&run_state, &ref_send_inputs](const Status& ret) {
+        VLOG(2) << "To unref buffer size: " << ref_send_inputs.size();
+        for (auto& ref : ref_send_inputs) {
+          ref->Unref();
+        }
+        ref_send_inputs.clear();
         {
           mutex_lock l(run_state.mu_);
           run_state.status.Update(ret);
@@ -908,6 +1118,10 @@ Status DirectSession::RunInternal(
   } else {
     args.executor_policy = ExecutorPolicy::USE_NORMAL_EXECUTOR;
   }
+
+  args.ref_send_inputs_mu_ptr = std::make_unique<mutex>();
+  args.ref_send_inputs_ptr = &ref_send_inputs;
+  args.merge_compute_and_copy_stream = merge_compute_and_copy_stream_;
 
   const bool do_trace = (run_options.trace_level() > RunOptions::NO_TRACE);
 
@@ -967,6 +1181,13 @@ Status DirectSession::RunInternal(
 
   if (run_in_caller_thread_) {
     pool = nullptr;
+  } else if (run_options.use_stage_subgraph_thread_pool()) {
+    auto stage_subgraph_threadpool = dynamic_cast<CustomThreadPoolImpl*>(
+        threadpool_options.inter_op_threadpool);
+    if (stage_subgraph_threadpool == nullptr)
+      return errors::Internal(
+          "Failed to convert stage subgraph inter op threadpool");
+    pool = stage_subgraph_threadpool->get_threadpool();
   } else if (threadpool_options.inter_op_threadpool != nullptr) {
     threadpool_wrapper = absl::make_unique<thread::ThreadPool>(
         threadpool_options.inter_op_threadpool);
@@ -1157,9 +1378,16 @@ Status DirectSession::Run(const RunOptions& run_options,
   run_state_args.collective_graph_key =
       run_options.experimental().collective_graph_key();
 
-  TF_RETURN_IF_ERROR(GetOrCreateExecutors(input_tensor_names, output_names,
-                                          target_nodes, &executors_and_keys,
-                                          &run_state_args));
+  if (run_metadata && !run_metadata->graph_signature().empty()) {
+    TF_RETURN_IF_ERROR(GetOrCreateExecutors(input_tensor_names, output_names,
+                                            target_nodes, &executors_and_keys,
+                                            &run_state_args, run_metadata->graph_signature()));
+  } else {
+    TF_RETURN_IF_ERROR(GetOrCreateExecutors(input_tensor_names, output_names,
+                                            target_nodes, &executors_and_keys,
+                                            &run_state_args));
+  }
+
   {
     mutex_lock l(collective_graph_key_lock_);
     collective_graph_key_ = executors_and_keys->collective_graph_key;
@@ -1196,10 +1424,23 @@ Status DirectSession::Run(const RunOptions& run_options,
   if (LogMemory::IsEnabled()) {
     LogMemory::RecordStep(step_id, run_state_args.handle);
   }
-
+  
+  auto thread_pool_options = thread::ThreadPoolOptions();
+  if (run_options.use_stage_subgraph_thread_pool()) {
+    int id = run_options.stage_subgraph_thread_pool_id();
+    if (id < 0 || id >= stage_subgraph_thread_pools_.size())
+      return errors::InvalidArgument(
+          "stage subgraph pool id (" + std::to_string(id) +
+          ") is out of range[0, " +
+          std::to_string(stage_subgraph_thread_pools_.size()) + ")");
+    thread_pool_options.inter_op_threadpool =
+        stage_subgraph_thread_pools_[id].first;
+    thread_pool_options.intra_op_threadpool =
+        stage_subgraph_thread_pools_[id].second;
+  }
   TF_RETURN_IF_ERROR(RunInternal(step_id, run_options, &call_frame,
                                  executors_and_keys, run_metadata,
-                                 thread::ThreadPoolOptions()));
+                                 thread_pool_options));  
 
   // Receive outputs.
   if (outputs) {
@@ -1716,6 +1957,7 @@ Status DirectSession::CreateExecutors(
       *r = new IntraProcessRendezvous(device_mgr);
       return Status::OK();
     };
+    params.run_cost_model_executor = run_cost_model_executor_;
 
     optimizer.Optimize(lib, options_.env, device, &partition_graph,
                        /*shape_map=*/nullptr);
@@ -1782,6 +2024,16 @@ Status DirectSession::GetOrCreateExecutors(
     gtl::ArraySlice<string> inputs, gtl::ArraySlice<string> outputs,
     gtl::ArraySlice<string> target_nodes, ExecutorsAndKeys** executors_and_keys,
     RunStateArgs* run_state_args) {
+  return GetOrCreateExecutors(inputs, outputs, target_nodes,
+                              executors_and_keys, run_state_args, "");
+}
+
+Status DirectSession::GetOrCreateExecutors(
+    gtl::ArraySlice<string> inputs, gtl::ArraySlice<string> outputs,
+    gtl::ArraySlice<string> target_nodes,
+    ExecutorsAndKeys** executors_and_keys,
+    RunStateArgs* run_state_args,
+    const std::string& graph_signature) {
   int64 handle_name_counter_value = -1;
   if (LogMemory::IsEnabled() || run_state_args->is_partial_run) {
     handle_name_counter_value = handle_name_counter_.fetch_add(1);
@@ -1793,11 +2045,19 @@ Status DirectSession::GetOrCreateExecutors(
         run_state_args->debug_options.debug_tensor_watch_opts());
   }
 
-  // Fast lookup path, no sorting.
-  const string key = strings::StrCat(
-      absl::StrJoin(inputs, ","), "->", absl::StrJoin(outputs, ","), "/",
-      absl::StrJoin(target_nodes, ","), "/", run_state_args->is_partial_run,
-      "/", debug_tensor_watches_summary);
+  static int64 executors_idx = 0;
+  std::string key("");
+  if (graph_signature.empty()) {
+    // Fast lookup path, no sorting.
+    key = strings::StrCat(
+        absl::StrJoin(inputs, ","), "->", absl::StrJoin(outputs, ","), "/",
+        absl::StrJoin(target_nodes, ","), "/", run_state_args->is_partial_run,
+        "/", debug_tensor_watches_summary);
+  } else {
+    // Fast lookup path with graph signature.
+    key = graph_signature;
+  }
+
   // Set the handle, if it's needed to log memory or for partial run.
   if (handle_name_counter_value >= 0) {
     run_state_args->handle =
@@ -1844,7 +2104,11 @@ Status DirectSession::GetOrCreateExecutors(
     if (it != executors_.end()) {
       *executors_and_keys = it->second.get();
       // Insert this under the original key.
-      executors_.emplace(key, it->second);
+      auto insert_key_status = executors_.emplace(key, it->second);
+      if (insert_key_status.second) {
+        LOG(INFO) << "Add new unsort key to executors_ map: " << executors_idx++
+                  << ", key: " << key << ", this: " << this;
+      }
       return Status::OK();
     }
   }
@@ -1885,8 +2149,12 @@ Status DirectSession::GetOrCreateExecutors(
 
   // Insert the value under the original key, so the fast path lookup will work
   // if the user uses the same order of inputs, outputs, and targets again.
-  executors_.emplace(key, insert_result.first->second);
+  auto insert_key_status = executors_.emplace(key, insert_result.first->second);
   *executors_and_keys = insert_result.first->second.get();
+  if (insert_key_status.second) {
+    LOG(INFO) << "Add new unsort key to executors_ map: " << executors_idx++
+              << ", key: " << key << ", this: " << this;
+  }
 
   return Status::OK();
 }
@@ -1980,6 +2248,13 @@ Status DirectSession::CreateGraphs(
   };
   popts.flib_def = &client_graph->graph.flib_def();
   popts.control_flow_added = false;
+
+  if (use_multi_stream_) {
+    // Split graph to multi-stream subgraph,
+    // We not do split here, just modify nodes' placement.
+    stream_subgraph::MarkStreamSubGraph(&client_graph->graph,
+        options_.config.graph_options().rewrite_options().multi_stream_opts());
+  }
 
   std::unordered_map<string, GraphDef> partitions;
   TF_RETURN_IF_ERROR(Partition(popts, &client_graph->graph, &partitions));
@@ -2317,6 +2592,12 @@ DirectSession::Callable::~Callable() {
   // or not).
   executors_and_keys.reset();
   function_info.reset();
+}
+
+void DirectSession::SetMultiStreamInfo(int stream_num, ResourceMgr* rmgr) {
+  use_multi_stream_ = true;
+  multi_stream_num_ = stream_num;
+  multi_stream_shared_rmgr_ = rmgr;
 }
 
 }  // namespace tensorflow

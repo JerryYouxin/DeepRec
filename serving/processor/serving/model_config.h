@@ -21,6 +21,9 @@ struct ModelConfig {
   // Run Info
   int inter_threads = 1;
   int intra_threads = 1;
+  int model_update_inter_threads = 0;
+  int model_update_intra_threads = 0;
+  std::string cpusets;
 
   // Embedding Config
   std::string feature_store_type;
@@ -53,12 +56,15 @@ struct ModelConfig {
   // "RR": Round-Robin policy, threads will use all sessions in Round-Robin way
   // "MOD": Thread select session according unique id, uid % session_num
   std::string select_session_policy = "MOD";
+  // GPU(s) used by current session group.
+  std::vector<size_t> gpu_ids;
+  bool use_multi_stream = false;
 
   // session use self-owned thread pool
   bool use_per_session_threads = false;
 
   // EmbeddingVariable Config
-  embedding::StorageType storage_type = embedding::StorageType::INVALID;
+  embedding::StorageType storage_type = embedding::StorageType::DEFAULT;
   std::string storage_path;
   std::vector<int64> storage_size;
 };

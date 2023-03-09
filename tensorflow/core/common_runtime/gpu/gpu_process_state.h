@@ -111,6 +111,14 @@ class GPUProcessState {
   // Returns bus_id for the given GPU id.
   virtual int BusIdForGPU(TfGpuId tf_gpu_id);
 
+  virtual Allocator* GetGpuHostAllocator(int numa_node, int device_id);  
+  
+  virtual void AddGpuHostAllocVisitorByDeviceId(int device_id,
+            const SubAllocator::Visitor& visitor);
+
+  virtual void AddGpuHostFreeVisitorByDeviceId(int device_id,
+				     const SubAllocator::Visitor& visitor);
+             
   SharedCounter* GPUAllocatorCounter(TfGpuId tf_gpu_id);
 
  protected:
@@ -150,6 +158,12 @@ class GPUProcessState {
       GUARDED_BY(mu_);
   std::vector<std::vector<SubAllocator::Visitor>> gpu_host_free_visitors_
       GUARDED_BY(mu_);
+  
+  std::vector<AllocatorParts> gpu_per_device_host_allocators_ GUARDED_BY(mu_);
+  std::vector<std::vector<SubAllocator::Visitor>> gpu_per_device_host_alloc_visitors_
+      GUARDED_BY(mu_);
+  std::vector<std::vector<SubAllocator::Visitor>> gpu_per_device_host_free_visitors_
+      GUARDED_BY(mu_);  
 };
 
 }  // namespace tensorflow

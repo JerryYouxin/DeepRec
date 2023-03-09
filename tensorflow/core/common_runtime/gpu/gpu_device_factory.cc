@@ -41,6 +41,9 @@ class GPUDevice : public BaseGPUDevice {
       force_gpu_compatible_ =
           options.config.gpu_options().force_gpu_compatible();
     }
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator_));
   }
 
   GPUDevice(const SessionOptions& options, const string& name,
@@ -56,6 +59,9 @@ class GPUDevice : public BaseGPUDevice {
       force_gpu_compatible_ =
           options.config.gpu_options().force_gpu_compatible();
     }
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator_));
   }
 
   Allocator* GetAllocator(AllocatorAttributes attr) override {
@@ -63,7 +69,10 @@ class GPUDevice : public BaseGPUDevice {
     if (attr.on_host()) {
       if (attr.gpu_compatible() || force_gpu_compatible_) {
         GPUProcessState* ps = GPUProcessState::singleton();
-        return ps->GetGpuHostAllocator(0);
+	if (use_per_session_host_allocator_) {
+	  return ps->GetGpuHostAllocator(0, tf_gpu_id());
+	}
+	return ps->GetGpuHostAllocator(0);
       } else {
         return cpu_allocator_;
       }
@@ -74,6 +83,7 @@ class GPUDevice : public BaseGPUDevice {
 
  private:
   bool force_gpu_compatible_ = false;
+  bool use_per_session_host_allocator_ = false;
 };
 
 class GPUDeviceFactory : public BaseGPUDeviceFactory {
@@ -110,26 +120,34 @@ class GPUCompatibleCPUDevice : public ThreadPoolDevice {
  public:
   GPUCompatibleCPUDevice(const SessionOptions& options, const string& name,
                          Bytes memory_limit, const DeviceLocality& locality,
-                         Allocator* allocator)
+                         Allocator* allocator, int host_id)
       : ThreadPoolDevice(options, name, memory_limit, locality, allocator),
-        numa_node_(locality.numa_node()) {
+        numa_node_(locality.numa_node()),
+        host_id_(host_id) {
     if (options.config.has_gpu_options()) {
       force_gpu_compatible_ =
           options.config.gpu_options().force_gpu_compatible();
     }
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator_));
   }
   GPUCompatibleCPUDevice(const SessionOptions& options, const string& name,
                          Bytes memory_limit, const DeviceLocality& locality,
-                         Allocator* allocator,
+                         Allocator* allocator, int host_id,
                          const DeviceResourceMgrMap* dev_rmgr_map,
                          const DeviceGlobalThreadPoolOptions& opt)
       : ThreadPoolDevice(options, name, memory_limit,
                          locality, allocator, dev_rmgr_map, opt),
-        numa_node_(locality.numa_node()) {
+        numa_node_(locality.numa_node()),
+        host_id_(host_id) {
     if (options.config.has_gpu_options()) {
       force_gpu_compatible_ =
           options.config.gpu_options().force_gpu_compatible();
     }
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator_));
   }
 
   ~GPUCompatibleCPUDevice() override {}
@@ -137,6 +155,9 @@ class GPUCompatibleCPUDevice : public ThreadPoolDevice {
   Allocator* GetAllocator(AllocatorAttributes attr) override {
     GPUProcessState* ps = GPUProcessState::singleton();
     if (attr.gpu_compatible() || force_gpu_compatible_) {
+      if (use_per_session_host_allocator_) {
+	return ps->GetGpuHostAllocator(numa_node_, host_id_);
+      }
       return ps->GetGpuHostAllocator(numa_node_);
     } else {
       // Call the parent's implementation.
@@ -147,6 +168,8 @@ class GPUCompatibleCPUDevice : public ThreadPoolDevice {
  private:
   bool force_gpu_compatible_ = false;
   int numa_node_ = port::kNUMANoAffinity;
+  int host_id_ = 0;
+  bool use_per_session_host_allocator_ = false;  
 };
 
 // The associated factory.
@@ -176,15 +199,30 @@ class GPUCompatibleCPUDeviceFactory : public DeviceFactory {
     int num_numa_nodes = options.config.experimental().use_numa_affinity()
                              ? port::NUMANumNodes()
                              : 1;
+    bool use_per_session_host_allocator = false;
+    TF_CHECK_OK(tensorflow::ReadBoolFromEnvVar("PER_SESSION_HOSTALLOC",
+                                               /*default_val=*/false,
+                                               &use_per_session_host_allocator)); 
+    int sess_num = 1;
+    if (use_per_session_host_allocator && dev_rmgr_map) {
+      for (auto& item : dev_rmgr_map->device_rmgr_map) {
+        int sess_idx = std::stoi(item.first.substr(item.first.rfind(":")+1));
+        if (sess_idx >= sess_num) {
+          sess_num = sess_idx + 1;
+        }
+      }
+    }
     for (int i = 0; i < n; i++) {
-      string name = strings::StrCat(name_prefix, "/device:CPU:", i);
       int numa_node = i % num_numa_nodes;
       DeviceLocality locality;
       locality.set_numa_node(numa_node);
-      devices->push_back(absl::make_unique<GPUCompatibleCPUDevice>(
-          options, name, Bytes(256 << 20), DeviceLocality(),
-          ProcessState::singleton()->GetCPUAllocator(numa_node),
-          dev_rmgr_map, opt));
+      for (int j = 0; j < sess_num; j++) {
+        string name = strings::StrCat(name_prefix, "/device:CPU:", i*sess_num+j);
+        devices->push_back(absl::make_unique<GPUCompatibleCPUDevice>(
+            options, name, Bytes(256 << 20), DeviceLocality(),
+            ProcessState::singleton()->GetCPUAllocator(numa_node), i*sess_num+j,
+            dev_rmgr_map, opt));
+      }
     }
 
     return Status::OK();

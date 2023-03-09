@@ -27,6 +27,9 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/mkl_types.h"
 #include "tensorflow/core/util/mkl_util.h"
+#ifdef DNNL_AARCH64_USE_ACL
+#include "tensorflow/core/platform/mutex.h"
+#endif
 
 using dnnl::primitive_attr;
 using dnnl::prop_kind;
@@ -88,6 +91,9 @@ class MklReorderWithScalePrimitive : public MklPrimitive {
 
   void Execute(void* src_data, void* dst_data,
                std::shared_ptr<stream> reorder_stream) {
+#ifdef DNNL_AARCH64_USE_ACL
+    mutex_lock lock(primitive_execution_mu_);
+#endif
 #ifdef ENABLE_DNNL_THREADPOOL
     context_.src_mem->set_data_handle(src_data, *reorder_stream);
     context_.dst_mem->set_data_handle(dst_data, *reorder_stream);
@@ -151,6 +157,10 @@ class MklReorderWithScalePrimitive : public MklPrimitive {
     context_.prim_args.insert({DNNL_ARG_FROM, *context_.src_mem});
     context_.prim_args.insert({DNNL_ARG_TO, *context_.dst_mem});
   }
+  
+#ifdef DNNL_AARCH64_USE_ACL
+  mutex primitive_execution_mu_;
+#endif
 };
 
 template <typename T>
@@ -449,7 +459,7 @@ class MklQuantizeV2Op : public OpKernel {
         // If it is signed, we try to keep 0.0 being 0 and drop one bucket. For
         // example, if it is 8 bits, we have the range [-127, 127]. So for input
         // range of [-x, x], the scale should be 254/(2*x).
-        target_range = static_cast<float>((uint64_t{1} << (num_bits - 1)) - 1);
+        target_range = static_cast<float>((uint64_t{1} << num_bits) - 1) / 2.;
       } else {
         max_range = max_abs;
         min_range = 0.0;

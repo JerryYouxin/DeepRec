@@ -89,6 +89,8 @@ class KernelStats {
         absl::make_unique<std::atomic<int64_t>[]>(gview.num_nodes());
     node_stats_count_ =
         absl::make_unique<std::atomic<int32_t>[]>(gview.num_nodes());
+    task_count_ =
+        absl::make_unique<std::atomic<int32_t>[]>(gview.num_nodes());
     for (int32_t i = 0; i < gview.num_nodes(); ++i) {
       if (gview.node(i)) {
         is_expensive_[i] =
@@ -96,6 +98,7 @@ class KernelStats {
         cost_estimates_[i] = kInitialCostEstimateCycles;
         immutable_avg_cost_[i] = 0;
         node_stats_count_[i] = 0;
+        task_count_[i] = 0;
       }
     }
   }
@@ -104,14 +107,14 @@ class KernelStats {
   // executor uses this flag to optimize graph execution, for example
   // by "inlining" inexpensive kernels.
   bool IsExpensive(const NodeItem& node) const {
-    return is_expensive_[node.node_id] &&
-           (cost_estimates_[node.node_id].load(std::memory_order_relaxed) >
+    return is_expensive_[node.node->id()] &&
+           (cost_estimates_[node.node->id()].load(std::memory_order_relaxed) >
             kOpIsExpensiveThresholdCycles);
   }
 
   // Returns the value of kernel->IsExpensive().
   bool HasExpensiveMarker(const NodeItem& node) const {
-    return is_expensive_[node.node_id];
+    return is_expensive_[node.node->id()];
   }
 
   // Updates the dynamic cost estimate, which is used to determine whether the
@@ -122,7 +125,7 @@ class KernelStats {
     // N.B. Updates to `cost_estimate` are atomic but unlocked.  Simultaneous
     // updates may result in one or more updates being ignored.  This does not
     // affect correctness but may slow down the update frequency.
-    std::atomic_uint_fast64_t& cost_estimate = cost_estimates_[node.node_id];
+    std::atomic_uint_fast64_t& cost_estimate = cost_estimates_[node.node->id()];
     auto prev_estimate = cost_estimate.load(std::memory_order_relaxed);
 
     uint64 new_estimate =
@@ -215,6 +218,7 @@ class KernelStats {
     }
 
     stat->op_start_time_ = Env::Default()->NowNanos();
+    task_count_[item->node->id()] = 0;
   }
 
   void StopCollectOp(const NodeItem* item, KernelStatsInfo* stat) {
@@ -225,33 +229,53 @@ class KernelStats {
     }
 
     stat->op_stop_time_ = Env::Default()->NowNanos();
-    if (item->node_id >= nodes_count_) {
+    if (item->node->id() >= nodes_count_) {
       LOG(WARNING) << "Item node is exceed nodes_count_, "
-                   << item->node_id << " VS " << nodes_count_;
+                   << item->node->id() << " VS " << nodes_count_;
     }
 
-    immutable_avg_cost_[item->node_id] +=
+    immutable_avg_cost_[item->node->id()] +=
         (stat->op_stop_time_ - stat->op_start_time_);
 
-    node_stats_count_[item->node_id]++;
+    node_stats_count_[item->node->id()]++;
     // Collect Other info here
 
   }
 
-  int64 GetNodeCost(const NodeItem* item) {
-    if (item->node_id >= nodes_count_) {
-      LOG(WARNING) << "Item node is exceed nodes_count_, "
-                   << item->node_id << " VS " << nodes_count_;
+  void OpScheduleTask(const NodeItem* item) {
+    if (!collect_kernel_stats ||
+        collect_stats_done_ ||
+        !collect_op_cost_) {
+      return;
     }
-    return immutable_avg_cost_[item->node_id];
+    task_count_[item->node->id()]++;
+  }
+
+  int64 GetNodeCost(const NodeItem* item) {
+    if (item->node->id() >= nodes_count_) {
+      LOG(WARNING) << "Item node is exceed nodes_count_, "
+                   << item->node->id() << " VS " << nodes_count_;
+    }
+    return immutable_avg_cost_[item->node->id()];
+  }
+
+  int64 GetIntraCost(const NodeItem* item) {
+    if (item->node->id() >= nodes_count_) {
+      LOG(WARNING) << "Item node is exceed nodes_count_, "
+                   << item->node->id() << " VS " << nodes_count_;
+    }
+    if (task_count_[item->node->id()] == 0) {
+      return immutable_avg_cost_[item->node->id()];
+    }
+    return immutable_avg_cost_[item->node->id()] / task_count_[item->node->id()];
   }
 
   int64 GetOpAccumulativeCost(const NodeItem* item) {
-    if (item->node_id >= nodes_count_) {
+    if (item->node->id() >= nodes_count_) {
       LOG(WARNING) << "Item node is exceed nodes_count_, "
-                 << item->node_id << " VS " << nodes_count_;
+                 << item->node->id() << " VS " << nodes_count_;
     }
-    return immutable_accumulative_cost_[item->node_id];
+    return immutable_accumulative_cost_[item->node->id()];
   }
 
   const std::vector<int64>* GetAccumulativeCostArray() {
@@ -301,6 +325,9 @@ class KernelStats {
   //   --> D(3) ------------
   // the max total execute time of A is MAX(1+1+1+0, 1+3+0) = 4
   std::vector<int64> immutable_accumulative_cost_;
+
+  // number of tasks scheduled by the operator to the thread pool
+  std::unique_ptr<std::atomic<int32_t>[]> task_count_;
 
   GraphView* gv_ = nullptr; // not owned
   Graph* g_ = nullptr; // not owned

@@ -110,6 +110,11 @@ class BaseGPUDevice : public LocalDevice {
     return platform_gpu_id.value();
   }
 
+  // Returns the tf gpu id of this device.
+  int tf_gpu_id() const {
+    return tf_gpu_id_.value();
+  }
+
   // The executor that provides control for the device; e.g., for CUDA this
   // corresponds to the cuda context.
   se::StreamExecutor* executor() const { return executor_; }
@@ -182,6 +187,7 @@ class BaseGPUDevice : public LocalDevice {
   int32 pending_cap_ = 0;
   bool timestamped_allocator_ = false;
   bool is_single_stream_mode_ = false;
+  void* cuda_graph_cublas_workspace_ = nullptr;
 
   // Initialize scractch buffers used by Eigen.
   Status InitScratchBuffers();

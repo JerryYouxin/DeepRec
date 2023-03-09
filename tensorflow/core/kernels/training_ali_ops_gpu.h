@@ -17,11 +17,10 @@ limitations under the License.
 #define TENSORFLOW_CORE_KERNELS_TRAINING_ALI_OPS_GPU_H_
 
 #if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/kernels/kv_variable_ops_gpu.h"
+#include "tensorflow/core/framework/embedding/embedding_var.h"
 
 namespace tensorflow {
 namespace functor {
@@ -30,22 +29,22 @@ template <typename Device, typename TKey, typename T>
 struct KvSparseApplyAdagrad {
   void operator()(int32 num_items,
                   Allocator* alloc,
-                  EmbeddingVarGPU<TKey, T>* var,
-                  EmbeddingVarGPU<TKey, T>* accum,
+                  EmbeddingVar<TKey, T>* var,
+                  EmbeddingVar<TKey, T>* accum,
                   const TKey* key_base,
                   const T* grad,
                   T lr,
                   int64 gs,
-                  cudaStream_t stream);
+                  const Device& device);
 };
 
 template <typename Device, typename TKey, typename T>
 struct KvSparseApplyFtrl {
   void operator()(int32 num_items,
                   Allocator* alloc,
-                  EmbeddingVarGPU<TKey, T>* var,
-                  EmbeddingVarGPU<TKey, T>* accum,
-                  EmbeddingVarGPU<TKey, T>* linear,
+                  EmbeddingVar<TKey, T>* var,
+                  EmbeddingVar<TKey, T>* accum,
+                  EmbeddingVar<TKey, T>* linear,
                   const TKey* key_base,
                   const T* grad,
                   T lr,
@@ -54,15 +53,15 @@ struct KvSparseApplyFtrl {
                   T lr_power,
                   bool has_l2_shrinkage,
                   T l2_shrinkage,
-                  cudaStream_t stream);
+                  const Device& device);
 };
 
 template <typename Device, typename T, typename Tindex, typename Tstep>
 struct KvSparseApplyAdamAsync {
   Status operator()(const Device &d, 
-                    EmbeddingVarGPU<Tindex, T> *var,
-                    EmbeddingVarGPU<Tindex, T> *m,
-                    EmbeddingVarGPU<Tindex, T> *v,
+                    EmbeddingVar<Tindex, T> *var,
+                    EmbeddingVar<Tindex, T> *m,
+                    EmbeddingVar<Tindex, T> *v,
                     typename TTypes<T>::Scalar beta1_power_scalar,
                     typename TTypes<T>::Scalar beta2_power_scalar, 
                     typename TTypes<Tindex>::ConstVec indices_vec,
@@ -75,9 +74,53 @@ struct KvSparseApplyAdamAsync {
                     bool apply_sparse_rmsprop, const int64 inner_dim, 
                     Allocator *alloc);
 };
+
+template <typename Device, typename TKey, typename T>
+struct KvSparseApplyAdagradHbm {
+  void operator()(int block_size, int embedding_dim,
+                  T** dev_a, T**dev_v, const T* grad_base,
+                  T lr_scalar, int64 task_size,
+                  const Device& device);
+};
+
+template <typename Device, typename TKey, typename T>
+struct KvSparseApplyAdamHbm {
+  void operator()(int block_size, int embedding_dim,
+                  T** dev_var, T** dev_m, T** dev_v,
+                  const T* grad_base, T alpha,
+                  T beta1, T beta2, T epsilon, int64 task_size,
+                  const Device& device);
+};
+
+template <typename Device, typename TKey, typename T>
+struct KvSparseApplyAdamAsyncHbm {
+  void operator()(int block_size, int embedding_dim,
+                  T** dev_var, T** dev_m, T** dev_v,
+                  const T* grad_base, T lr, T beta1,
+                  T beta2, T epsilon, T* beta1_power_ptr,
+                  T* beta2_power_ptr, int64 task_size,
+                  const Device& device);
+};
+
+template <typename Device, typename TKey, typename T>
+struct KvSparseApplyAdamAsyncSparseRmspropHbm {
+  void operator()(int block_size, int embedding_dim,
+                  T** dev_var, T** dev_m, T** dev_v,
+                  const T* grad_base, T lr, T beta1,
+                  T beta2, T epsilon, int64 task_size,
+                  const Device& device);
+};
+
+template <typename Device, typename TKey, typename T>
+struct KvSparseApplyAdamWHbm {
+  void operator()(int block_size, int embedding_dim,
+                  T** dev_var, T** dev_m, T** dev_v,
+                  const T* grad_base, T lr, T beta1,
+                  T beta2, T epsilon, T weight_decay,
+                  int64 task_size, const Device& device);
+};
 }  // end namespace functor
 }  // end namespace tensorflow
-#endif  // TENSORFLOW_USE_GPU_EV
 #endif  // GOOGLE_CUDA
 
 #endif  // TENSORFLOW_CORE_KERNELS_TRAINING_ALI_OPS_GPU_H_

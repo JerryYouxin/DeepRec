@@ -16,10 +16,13 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/immutable_executor_state.h"
 
 #include "absl/memory/memory.h"
+#include "tensorflow/core/common_runtime/renamed_device.h"
+#include "tensorflow/core/common_runtime/virtual_threadpool.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/graph/edgeset.h"
 #include "tensorflow/core/graph/graph.h"
+#include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/logging.h"
 
@@ -123,7 +126,7 @@ Status ImmutableExecutorState::Initialize() {
     FrameInfo* frame_info = EnsureFrameInfo(frame_name);
 
     NodeItem* item = gview_.node(id);
-    item->node_id = id;
+    item->node = n;
 
     item->input_start = frame_info->total_inputs;
     frame_info->total_inputs += n->num_inputs();
@@ -144,7 +147,11 @@ Status ImmutableExecutorState::Initialize() {
         break;
       }
     }
+#ifndef TF_API_COMPATIBLE_1150
     const Tensor* const_tensor = item->kernel->const_tensor();
+#else
+    const Tensor* const_tensor = nullptr;
+#endif
     if (const_tensor) {
       // Hold onto a shallow copy of the constant tensor in `*this` so that the
       // reference count does not drop to 1. This prevents the constant tensor
@@ -254,6 +261,20 @@ Status ImmutableExecutorState::Initialize() {
   // for all nodes.
   InitializePending(&graph, cf_info);
   return gview_.SetAllocAttrs(&graph, params_.device);
+}
+
+Status ImmutableExecutorState::InitializeScheduleInfo(ExecutorInternal::KernelStats* kernel_stats) {
+  for (const Node* n : graph_->nodes()) {
+    if (IsSink(n)) continue;
+    const int id = n->id();
+    NodeItem* item = gview_.node(id);
+    CHECK(item->kernel);
+    auto eigen_threadpool = params_.device->tensorflow_cpu_worker_threads()->workers->AsEigenThreadPool();
+    item->virtual_threadpool.reset(new VirtualThreadpool(eigen_threadpool, item, kernel_stats));
+    item->virtual_device = RenamedDevice::NewRenamedDevice(
+        params_.device->name(), params_.device, false, false, item->virtual_threadpool.get());
+  }
+  return Status::OK();
 }
 
 namespace {

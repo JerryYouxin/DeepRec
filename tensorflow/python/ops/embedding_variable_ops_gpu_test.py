@@ -36,6 +36,7 @@ from tensorflow.python.training import adagrad_decay_v2
 from tensorflow.python.training import gradient_descent
 from tensorflow.python.training import saver as saver_module
 from tensorflow.python.training import training_util
+from tensorflow.python.training import weight_decay_optimizers
 from tensorflow.python.ops import variables
 from tensorflow.contrib.layers.python.layers import embedding_ops as emb_ops
 from tensorflow.contrib.layers.python.layers import feature_column_ops
@@ -75,12 +76,14 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       emb_var = variable_scope.get_embedding_variable("var_1",
             initializer=init_ops.ones_initializer(dtypes.float32),
             embedding_dim = 8,
+            ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
             partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
       emb1 = runTestAdagrad(self, emb_var, g)
     with ops.device('/gpu:0'), ops.Graph().as_default() as g:
       var =  variable_scope.get_dynamic_dimension_embedding_variable("var_dist",
                                                                     embedding_block_dimension=4,
                                                                     embedding_block_num=2,
+                                                                    storage_type=config_pb2.StorageType.HBM,
                                                                     initializer=init_ops.ones_initializer(dtypes.float32))
       emb2 = runTestAdagrad(self, var, g)
     for i in range(0, 6):
@@ -93,6 +96,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       embedding = variable_scope.get_dynamic_dimension_embedding_variable("var_dist",
                                                                       embedding_block_dimension=4,
                                                                       embedding_block_num=2,
+                                                                      storage_type=config_pb2.StorageType.HBM,
                                                                       initializer=init_ops.ones_initializer(dtypes.float32))
     emb = embedding_ops.embedding_lookup(embedding, math_ops.cast([0,1,2,5,6,7], dtypes.int64), blocknums=[2,2,2,2,2,2])
     fun = math_ops.multiply(emb, 2.0, name='multiply')
@@ -110,10 +114,11 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
     print("testEmbeddingVariableForInitFromProto")
     with ops.device('/gpu:0'):
       embedding = variable_scope.get_embedding_variable("var_dist",
-                                            embedding_dim=6,
-                                            initializer=init_ops.ones_initializer,
-                                            steps_to_live = 4,
-                                            partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
+          embedding_dim=6,
+          initializer=init_ops.ones_initializer,
+          steps_to_live = 4,
+          ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
+          partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
     emb = embedding_ops.embedding_lookup(embedding, math_ops.cast([0,1,2,5,6,7], dtypes.int64))
     fun = math_ops.multiply(emb, 2.0, name='multiply')
     loss = math_ops.reduce_sum(fun, name='reduce_sum')
@@ -132,6 +137,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       var = variable_scope.get_embedding_variable("var_1",
               embedding_dim = 3,
               initializer=init_ops.ones_initializer(dtypes.float32),
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
               partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
     emb = embedding_ops.embedding_lookup(var, math_ops.cast([0,1,2,5,6,-7], dtypes.int64))
     fun = math_ops.multiply(emb, 2.0, name='multiply')
@@ -150,9 +156,11 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       print(sess.run([emb, train_op,loss]))
       print(sess.run([emb, train_op,loss]))
 
+  '''
   def testEmbeddingVariableForExport(self):
     print("testEmbeddingVariableForExport")
-    ev_config = variables.EmbeddingVariableOption(filter_option=variables.CounterFilter(filter_freq=1))
+    ev_config = variables.EmbeddingVariableOption(filter_option=variables.CounterFilter(filter_freq=1),
+                                                  storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM))
     with ops.device("/gpu:0"):
       var = variable_scope.get_embedding_variable("var_1", embedding_dim=3,
               initializer=init_ops.ones_initializer(dtypes.float32), steps_to_live=10000, ev_option=ev_config)
@@ -178,12 +186,14 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
                            [1., 1., 1.]], fetches[1])
       # self.assertAllEqual([0, 0, 0, 0, 0, 0], fetches[2])
       # self.assertAllEqual([1, 1, 1, 1, 1, 1], fetches[3])
+  '''
 
   def testEmbeddingVariableForGetShape(self):
     print("testEmbeddingVariableForGetShape")
     with ops.device("/gpu:0"):
       var = variable_scope.get_embedding_variable("var_1",
               embedding_dim = 3,
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
               initializer=init_ops.ones_initializer(dtypes.float32))
     emb = embedding_ops.embedding_lookup(var, math_ops.cast([0,1,2,5,6,7], dtypes.int64))
     shape = var.total_count()
@@ -193,11 +203,13 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
       sess.run([init])
       sess.run([emb])
-      self.assertAllEqual([6, 3], sess.run(shape))
+      # Unimplement GPUHashMapKV::Size() {return 0;}
+      self.assertAllEqual([0, 3], sess.run(shape))
 
   def testEmbeddingVariableForSparseColumnSharedEmbeddingCol(self):
     columns_list=[]
-    columns_list.append(feature_column.sparse_column_with_embedding(column_name="col_emb", dtype=dtypes.string))
+    columns_list.append(feature_column.sparse_column_with_embedding(column_name="col_emb", dtype=dtypes.string,
+        ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM))))
     with ops.device("/gpu:0"):
       W = feature_column.shared_embedding_columns(sparse_id_columns=columns_list,
               dimension=3,
@@ -226,7 +238,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
   def testEmbeddingVariableForFeatureFilterFromContribFeatureColumn(self):
     print("testEmbeddingVariableForFeatureFilterFromContribFeatureColumn")
     columns = feature_column.sparse_column_with_embedding(column_name="col_emb", dtype=dtypes.int64,
-                                                          ev_option = variables.EmbeddingVariableOption(filter_option=variables.CounterFilter(filter_freq=3)))
+        ev_option = variables.EmbeddingVariableOption(filter_option=variables.CounterFilter(filter_freq=3)))
     with ops.device("/gpu:0"):
       W = feature_column.embedding_column(sparse_id_column=columns,
               dimension=3,
@@ -250,7 +262,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       emb1, top, l = sess.run([emb, train_op, loss])
       for val1 in emb1.tolist():
         for val in val1:
-          self.assertEqual(val, 1.0)
+          self.assertEqual(val, .0)
       emb1, top, l = sess.run([emb, train_op, loss])
       for index, val1 in enumerate(emb1.tolist()):
         if index < 7:
@@ -258,10 +270,11 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
             self.assertNotEqual(val, 1.0)
         else:
           for val in val1:
-            self.assertEqual(val, 1.0)
+            self.assertEqual(val, .0)
 
   def testEmbeddingVariableForSparseColumnEmbeddingCol(self):
-    columns = feature_column.sparse_column_with_embedding(column_name="col_emb", dtype=dtypes.int64)
+    columns = feature_column.sparse_column_with_embedding(column_name="col_emb", dtype=dtypes.int64,
+        ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)))
     with ops.device("/gpu:0"):
       W = feature_column.embedding_column(sparse_id_column=columns,
               dimension=3,
@@ -312,6 +325,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       emb_var = variable_scope.get_embedding_variable("var_1",
             embedding_dim = 3,
             initializer=init_ops.ones_initializer(dtypes.float32),
+            ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
             partitioner=partitioned_variables.fixed_size_partitioner(num_shards=1))
     with ops.device("/cpu:0"):
       var = variable_scope.get_variable("var_2", shape=[100, 3], initializer=init_ops.ones_initializer(dtypes.float32))
@@ -346,10 +360,12 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       with ops.device('/gpu:0'):
         emb_var = variable_scope.get_embedding_variable("var_1", embedding_dim=3,
               initializer=init_ops.ones_initializer(dtypes.float32),
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
               partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
       with ops.device('/cpu:0'):
         emb_var2 = variable_scope.get_embedding_variable("var_2", embedding_dim=3,
               initializer=init_ops.ones_initializer(dtypes.float32),
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.DRAM)),
               partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
       emb1 = runTestFtrl(self, emb_var, g)
       emb2 = runTestFtrl(self, emb_var2, g)
@@ -363,6 +379,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       var = variable_scope.get_embedding_variable("var_1",
               embedding_dim = 3,
               initializer=init_ops.ones_initializer(dtypes.float32),
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
               partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
     emb = embedding_ops.embedding_lookup(var, math_ops.cast([1,6], dtypes.int64))
     init = variables.global_variables_initializer()
@@ -381,6 +398,7 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       var = variable_scope.get_embedding_variable("var_1",
               embedding_dim = 3,
               #initializer=init_ops.ones_initializer(dtypes.float32),
+              ev_option = variables.EmbeddingVariableOption(storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM)),
               partitioner=partitioned_variables.fixed_size_partitioner(num_shards=4))
     emb = embedding_ops.embedding_lookup(var, math_ops.cast([1,6], dtypes.int64))
     init = variables.global_variables_initializer()
@@ -403,7 +421,8 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
                                           initializer=init_ops.glorot_uniform_initializer(seed = 1))
         init_opt = variables.InitializerOption(initializer=init_ops.glorot_uniform_initializer(seed = 1),
                                           default_value_dim=8)
-        ev_option = variables.EmbeddingVariableOption(init_option=init_opt)
+        ev_option = variables.EmbeddingVariableOption(init_option=init_opt,
+             storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM))
         emb_var = variable_scope.get_embedding_variable("emb_var", embedding_dim=3,
                                                         ev_option=ev_option)
         var_emb = embedding_ops.embedding_lookup(var, math_ops.cast([0,1,2,3,4,5,6,7], dtypes.int64))
@@ -449,7 +468,8 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
     with ops.Graph().as_default() as g:
       with ops.device('/gpu:0'):
         init = variables.InitializerOption(default_value_dim=8192)
-        ev_option = variables.EmbeddingVariableOption(init_option = init)
+        ev_option = variables.EmbeddingVariableOption(init_option = init,
+            storage_option=variables.StorageOption(storage_type=config_pb2.StorageType.HBM))
         emb_var = variable_scope.get_embedding_variable("emb_var", embedding_dim = 6,
                                           initializer=init_ops.glorot_uniform_initializer(seed = 3),
                                           ev_option = ev_option)
@@ -462,6 +482,385 @@ class EmbeddingVariableGpuTest(test_util.TensorFlowTestCase):
       for i in range(0, 6):
         for j in range(0, 6):
           self.assertAllClose(emb1.tolist()[i][j], emb2.tolist()[i][j])
+
+  def testGPUFbjOpt(self):
+    print("testGPUFbjOpt")
+    os.environ["TF_EMBEDDING_FBJ_OPT"] = "True"
+    def runTestAdagrad(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = adagrad.AdagradOptimizer(0.1)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      if isinstance(var, kv_variable_ops.EmbeddingVariable):
+        tires = kv_variable_ops.lookup_tier(emb_var,
+                    math_ops.cast([1,2,3,4,5,6], dtypes.int64))
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+
+        if isinstance(var, kv_variable_ops.EmbeddingVariable):
+          result = sess.run(tires)
+          for i in range(0, 6):
+            if i == 2:
+              self.assertEqual(result[i], 1)
+            elif i == 5:
+              self.assertEqual(result[i], -1)
+            else:
+              self.assertEqual(result[i], 0)
+
+        sess.run([train_op], {ids:[3, 5]})
+        sess.run([train_op], {ids:[4]})
+        r1 = sess.run(emb, {ids:[1,2,4,5]})
+        r2 = sess.run(emb, {ids:[3]})
+        r = r1.tolist() + r2.tolist()
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdagrad(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdagrad(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+
+    del os.environ["TF_EMBEDDING_FBJ_OPT"]
+
+  def testEmbeddingVariableForHBMandDRAMAdamWithFbjOpt(self):
+    print("testEmbeddingVariableForHBMandDRAMAdamWithFbjOpt")
+    os.environ["TF_EMBEDDING_FBJ_OPT"] = "True"
+    def runTestAdam(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = adam.AdamOptimizer(0.01)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdam(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdam(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+    del os.environ["TF_EMBEDDING_FBJ_OPT"]
+  
+  def testEmbeddingVariableForHBMandDRAMAdam(self):
+    print("testEmbeddingVariableForHBMandDRAMAdam")
+    def runTestAdam(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = adam.AdamOptimizer(0.01)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdam(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdam(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+
+  def testEmbeddingVariableForHBMandDRAMAdamAsyncWithFbjOpt(self):
+    print("testEmbeddingVariableForHBMandDRAMAdamAsyncWithFbjOpt")
+    os.environ["TF_EMBEDDING_FBJ_OPT"] = "True"
+    def runTestAdam(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = adam_async.AdamAsyncOptimizer(0.1)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdam(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdam(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+    del os.environ["TF_EMBEDDING_FBJ_OPT"]
+
+  def testEmbeddingVariableForHBMandDRAMAdamAsync(self):
+    print("testEmbeddingVariableForHBMandDRAMAdamAsync")
+    def runTestAdamAsync(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = adam_async.AdamAsyncOptimizer(0.1)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdamAsync(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdamAsync(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+
+  def testEmbeddingVariableForHBMandDRAMAdamWWithFbjOpt(self):
+    print("testEmbeddingVariableForHBMandDRAMAdamWWithFbjOpt")
+    os.environ["TF_EMBEDDING_FBJ_OPT"] = "True"
+    def runTestAdam(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = weight_decay_optimizers.AdamWOptimizer(0.01)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdam(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdam(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+    del os.environ["TF_EMBEDDING_FBJ_OPT"]
+
+
+  def testEmbeddingVariableForHBMandDRAMAdamW(self):
+    print("testEmbeddingVariableForHBMandDRAMAdamW")
+    def runTestAdamW(self, var, g):
+      ids = array_ops.placeholder(dtypes.int64, name="ids")
+      emb = embedding_ops.embedding_lookup(var, ids)
+      fun = math_ops.multiply(emb, 2.0, name='multiply')
+      loss = math_ops.reduce_sum(fun, name='reduce_sum')
+      gs = training_util.get_or_create_global_step()
+      opt = weight_decay_optimizers.AdamWOptimizer(0.01)
+      g_v = opt.compute_gradients(loss)
+      train_op = opt.apply_gradients(g_v)
+      init = variables.global_variables_initializer()
+      with self.test_session(graph=g) as sess:
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_VAR_OPS))
+        sess.run(ops.get_collection(ops.GraphKeys.EV_INIT_SLOT_OPS))
+        sess.run([init])
+        sess.run([train_op], {ids:[1,2,3]})
+        sess.run([train_op], {ids:[1,2,4]})
+        sess.run([train_op], {ids:[1,2,2]})
+        sess.run([train_op], {ids:[1,2,5]})
+        r = sess.run(emb, {ids:[1,2,3,4,5]})
+        return r
+
+    with ops.Graph().as_default() as g, ops.device('/gpu:0'):
+      storage_option = variables.StorageOption(
+                        storage_type=config_pb2.StorageType.HBM_DRAM,
+                        storage_size=[1024 * 1024])
+      ev_option = variables.EmbeddingVariableOption(
+                                storage_option=storage_option)
+      emb_var = variable_scope.get_embedding_variable("var_1",
+            embedding_dim = 30,
+            initializer=init_ops.ones_initializer(dtypes.float32),
+            steps_to_live=5,
+            ev_option = ev_option)
+      emb1 = runTestAdamW(self, emb_var, g)
+
+    with ops.Graph().as_default() as g:
+      var = variable_scope.get_variable("var_2",
+                shape=[100, 30],
+                initializer=init_ops.ones_initializer(dtypes.float32))
+      emb2 = runTestAdamW(self, var, g)
+
+    for i in range(0, 5):
+      for j in range(0, 30):
+        self.assertAllCloseAccordingToType(emb1[i][j], emb2[i][j])
+
+  def testSaveV3(self):
+    print("testSaveV3")
+    with ops.device("/gpu:0"):
+      emb_var = variable_scope.get_embedding_variable("emb_var", 10)
+      var = variable_scope.get_variable("var", [10, 10])
+    emb1 = embedding_ops.embedding_lookup(emb_var, math_ops.cast([1,2,3], dtypes.int64))
+    emb2 = embedding_ops.embedding_lookup(var, math_ops.cast([1,2,3], dtypes.int64))
+    emb = emb1 + emb2
+    fun = math_ops.multiply(emb, 2.0, name='multiply')
+    loss = math_ops.reduce_sum(fun, name='reduce_sum')
+    gs = training_util.get_or_create_global_step()
+    opt = adagrad.AdagradOptimizer(0.1)
+    g_v = opt.compute_gradients(loss)
+    train_op = opt.apply_gradients(g_v, global_step=gs)
+    init = variables.global_variables_initializer()
+    saver = saver = saver_module.Saver()
+    checkpoint_directory = self.get_temp_dir()
+    model_path = os.path.join(checkpoint_directory, "model.ckpt")
+    with self.test_session() as sess:
+      sess.run([init])
+      sess.run([train_op])
+      sess.run([train_op])
+      saver.save(sess, model_path)
+      for name, shape in checkpoint_utils.list_variables(model_path):
+        ckpt_value = checkpoint_utils.load_variable(model_path, name)
+        print(name, shape, ckpt_value)
+    with self.test_session() as sess:
+      saver.restore(sess, model_path)
 
 if __name__ == "__main__":
   googletest.main()

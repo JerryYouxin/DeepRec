@@ -101,13 +101,16 @@ The triangles represent mlp network. The inputs consists of dense features and s
       - `--smartstaged`: Whether to enable smart staged feature of DeepRec, Default to True.
       - `--micro_batch`: Set num for Auto Mirco Batch. Default 0 to close.(Not really enabled)
       - `--ev`: Whether to enable DeepRec EmbeddingVariable. Default to False.
+      - `--group_embedding`: Use GroupEmbedding features.
       - `--adaptive_emb`: Whether to enable Adaptive Embedding. Default to False.
       - `--ev_elimination`: Set Feature Elimination of EmbeddingVariable Feature. Options [None, 'l2', 'gstep'], default to None.
       - `--ev_filter`: Set Feature Filter of EmbeddingVariable Feature. Options [None, 'counter', 'cbf'], default to None.
       - `--dynamic_ev`: Whether to enable Dynamic-dimension Embedding Variable. Default to False.(Not really enabled)
       - `--incremental_ckpt`: Set time of save Incremental Checkpoint. Default 0 to close.
       - `--workqueue`: Whether to enable Work Queue. Default to False.
-      - `--protocol`: Set the protocol ['grpc', 'grpc++', 'star_server'] used when starting server in distributed training. Default to grpc. 
+      - `--protocol`: Set the protocol ['grpc', 'grpc++', 'star_server'] used when starting server in distributed training. Default to grpc.
+      - `--parquet_dataset`: Whether to enable ParquetDataset. Default is `True`.
+      - `--parquet_dataset_shuffle`: Whether to enable shuffle operation for Parquet Dataset. Default to `False`. 
     - Basic Settings:
       - `--data_location`: Full path of train & eval data, default to `./data`.
       - `--steps`: Set the number of steps on train dataset. Default will be set to 1 epoch.
@@ -245,8 +248,13 @@ The benchmark is performed on the [Alibaba Cloud ACK Service(Alibaba Cloud Conta
 ## Dataset
 Train & eval dataset using ***Kaggle Display Advertising Challenge Dataset (Criteo Dataset)***.
 ### Prepare
+We provide the dataset in two formats:
+1. **CSV Format**
 Put data file **train.csv & eval.csv** into ./data/    
-For details of Data download, see [Data Preparation](data/README.md)
+For details of Data download, see [Data Preparation](data/README.md).
+2. **Parquet Format**
+Put data file **train.parquet & eval.parquet** into ./data/
+These files are available at [Criteo Parquet Dataset](https://deeprec-dataset.oss-cn-beijing.aliyuncs.com/parquet_dataset/criteo_categorical_string.tar.gz).
 
 ### Fields
 Total 40 columns:  

@@ -28,6 +28,7 @@ limitations under the License.
 #include <string.h>
 
 #include <algorithm>
+#include <cuda_runtime.h>
 #include <list>
 #include <map>
 #include <tuple>
@@ -358,6 +359,13 @@ BaseGPUDevice::~BaseGPUDevice() {
   delete gpu_device_info_;
   for (auto sb : scratch_) gpu_allocator_->DeallocateRaw(sb);
   for (auto ctx : device_contexts_) ctx->Unref();
+  if (cuda_graph_cublas_workspace_ != nullptr) {
+    cudaError_t e_cu_free_cublas_worksapce = cudaFree(cuda_graph_cublas_workspace_);
+    if (e_cu_free_cublas_worksapce != cudaSuccess) {
+      LOG(ERROR) << std::string("free cuBLAS workspace failed ")
+                 << cudaGetErrorString(e_cu_free_cublas_worksapce);
+    }
+  }
 }
 
 // This should be idempotent if already initialized.
@@ -501,7 +509,18 @@ Status BaseGPUDevice::Init(const SessionOptions& options) {
       return errors::InvalidArgument(error_message);
     }
   }
-
+  if ((options.config.gpu_options().cuda_graph_mode_compatible() ||
+      options.config.gpu_options().cuda_graph_enable_jit())
+      && cuda_graph_cublas_workspace_ == nullptr) {
+    int num_bytes = 1 << 22;
+    cudaError_t e_cu_malloc_cublas = cudaMalloc(&cuda_graph_cublas_workspace_, num_bytes);
+    if (e_cu_malloc_cublas != cudaSuccess) {
+      return errors::Internal("malloc buffer for cublas workspace failed");
+    }
+    se::Stream* default_stream = streams_.front()->compute;
+    default_stream->parent()->AsBlas()->SetWorkspace(
+        default_stream, cuda_graph_cublas_workspace_, num_bytes);
+  }
   return Status::OK();
 }
 
@@ -679,17 +698,42 @@ Status BaseGPUDevice::MaybeCopyTensorToGPU(
       return err;
     }
 
-    StatusCallback wrapped_done = std::bind(
-        [to, copy](StatusCallback done_,
-                   // Begin unbound arguments.
-                   const Status& s) {
-          if (s.ok()) {
-            *to = std::move(*copy);
-          }
-          delete copy;
-          done_(s);
-        },
-        std::move(done), std::placeholders::_1);
+    StatusCallback wrapped_done;
+    if (GPUUtil::MergeComputeAndCopyStream()) {
+      TensorReference input_ref(from);
+      auto recv_host_to_device_stream = device_contexts_[0]->stream();
+      auto event_mgr = em_;
+      wrapped_done = std::bind(
+          [to, copy, recv_host_to_device_stream, event_mgr, input_ref](
+              StatusCallback done_,
+              // Begin unbound arguments.
+              const Status& s) {
+            event_mgr->ThenExecute(
+                recv_host_to_device_stream,
+                [to, copy, recv_host_to_device_stream, done_, &s, input_ref]() {
+                  input_ref.Unref();
+                  if (!recv_host_to_device_stream->ok()) {
+                    LOG(FATAL) << "CPU->GPU Memcpy failed";
+                  }
+                  *to = std::move(*copy);
+                  delete copy;
+                  done_(s);
+                });
+          },
+          std::move(done), std::placeholders::_1);
+    } else {
+      wrapped_done = std::bind(
+          [to, copy](StatusCallback done_,
+                     // Begin unbound arguments.
+                     const Status& s) {
+            if (s.ok()) {
+              *to = std::move(*copy);
+            }
+            delete copy;
+            done_(s);
+          },
+          std::move(done), std::placeholders::_1);
+    }
 
     tracing::ScopedAnnotation annotation("MakeTensorFromProto");
     device_contexts_[0]->CopyCPUTensorToDevice(
@@ -877,21 +921,24 @@ int64 MinSystemMemory(int64 available_memory, int cc_major) {
   //
   // If the available_memory is < 2GiB, we allocate 225MiB to system memory.
   // Otherwise, depending on the capability version assign
-  //  675MiB (for cuda_compute_capability <= 6.x) or
+  //  715MiB (for cuda_compute_capability <= 6.x) or
   // 1064MiB (for cuda_compute_capability <= 7.x) or
-  // 1600MiB (for cuda_compute_capability >= 8.x)
+  // 1800MiB (for cuda_compute_capability >= 8.x) or
+  // 4096MiB (for cuda_compute_capability >= 9.x)
   //
   // In the future we could be more sophisticated by using a table of devices.
   int64 min_system_memory;
   if (available_memory < (1LL << 31)) {
-    min_system_memory = 225 * 1024 * 1024;
+    min_system_memory = 225LL * 1024 * 1024;
   } else {
     if (cc_major <= 6) {
-      min_system_memory = 675 * 1024 * 1024;
+      min_system_memory = 715LL * 1024 * 1024;
     } else if (cc_major <= 7) {
-      min_system_memory = 1064 * 1024 * 1024;
+      min_system_memory = 1064LL * 1024 * 1024;
+    } else if (cc_major <= 8) {
+      min_system_memory = 1800LL * 1024 * 1024;
     } else {
-      min_system_memory = 1600 * 1024 * 1024;
+      min_system_memory = 4096LL * 1024 * 1024;
     }
   }
 #if defined(__GNUC__) && defined(__OPTIMIZE__)
@@ -908,7 +955,7 @@ int64 MinSystemMemory(int64 available_memory, int cc_major) {
 #if defined(ANDROID_TEGRA)
   // 1GB system mem for NVIDIA Tegra devices since they use the same mem for
   // RAM and Video RAM
-  min_system_memory = 1 << 30;
+  min_system_memory = 1LL << 30;
 #endif
   return min_system_memory;
 }
@@ -1172,7 +1219,13 @@ Status BaseGPUDeviceFactory::CreateDevices(
       }
 #endif
     }
-    // Reset to the original device.
+    // Reset to the original device, if it is a valid visible gpu.
+    // Otherwise use the first valid device.
+    if (std::find(valid_platform_gpu_ids.begin(),
+                  valid_platform_gpu_ids.end(),
+                  original_device) == valid_platform_gpu_ids.end()) {
+      original_device = valid_platform_gpu_ids[0].value();
+    }
 #if GOOGLE_CUDA
     err = cudaSetDevice(original_device);
     if (err != cudaSuccess) {

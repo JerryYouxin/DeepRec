@@ -36,9 +36,9 @@ limitations under the License.
 #endif  // TENSORFLOW_USE_SYCL
 
 #if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
+#include "tensorflow/core/kernels/gpu_device_array.h"
 #include "tensorflow/core/kernels/training_ali_ops_gpu.h"
-#endif  // TENSORFLOW_USE_GPU_EV
+#include "tensorflow/core/platform/stream_executor.h"
 #endif  // GOOGLE_CUDA
 
 namespace tensorflow {
@@ -67,7 +67,7 @@ struct ApplyAdagradDecay<CPUDevice, T> {
 
 }
 
-template <typename TKey, typename T, typename Tstep>
+template <typename TKey, typename T, typename Tstep, bool indices_as_pointer>
 class KvSparseApplyAdagradOp : public OpKernel {
  public:
   explicit KvSparseApplyAdagradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -131,7 +131,8 @@ class KvSparseApplyAdagradOp : public OpKernel {
             const TKey index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter = false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             var->UpdateVersion(value_ptr, gs);
             if (is_filter) {
               auto a = accum->flat(value_ptr);
@@ -139,7 +140,6 @@ class KvSparseApplyAdagradOp : public OpKernel {
               auto v = var->flat(value_ptr);
               a += g.square();
               v -= g.constant(lr_scalar) * g * a.rsqrt();
-              var->Commit(index, value_ptr);
             }
           }
         };
@@ -160,7 +160,13 @@ class KvSparseApplyAdagradOp : public OpKernel {
                               .TypeConstraint<T>("T")                \
                               .TypeConstraint<Tindices>("Tindices")  \
                               .TypeConstraint<Tstep>("Tstep"),       \
-                          KvSparseApplyAdagradOp<Tindices, T, Tstep>);
+                          KvSparseApplyAdagradOp<Tindices, T, Tstep, false>); \
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdagrad")  \
+                              .Device(DEVICE_CPU)                    \
+                              .TypeConstraint<T>("T")                \
+                              .TypeConstraint<Tindices>("Tindices")  \
+                              .TypeConstraint<Tstep>("Tstep"),       \
+                          KvSparseApplyAdagradOp<Tindices, T, Tstep, true>);
 #define REGISTER_CPU_KERNELS(T)        \
   REGISTER_KERNELS(int32, T, int32);   \
   REGISTER_KERNELS(int64, T, int32);   \
@@ -173,22 +179,99 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 #undef REGISTER_KERNELS
 
 #if GOOGLE_CUDA
-#if !TENSORFLOW_USE_GPU_EV
-template <typename TKey, typename T, typename Tstep>
+template <typename Device, typename TKey, typename T, typename Tstep, bool indices_as_pointer>
 class KvSparseApplyAdagradGPUOp : public OpKernel {
  public:
   explicit KvSparseApplyAdagradGPUOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+
+    int num_worker_threads = ctx->device()
+                             ->tensorflow_cpu_worker_threads()
+                             ->num_threads;
+    thread_copy_id_alloc_ = new ThreadCopyIdAllocator(num_worker_threads);
+
+    get_default_v_fn_ =
+        [](T* default_v, TKey id,
+          int64 index, int64 total_dim, int64 len) {
+      return default_v + len * (id % total_dim);
+    };
+  }
+
+  ~KvSparseApplyAdagradGPUOp() {
+    delete thread_copy_id_alloc_;
+  }
+
+  void LookupEmbeddingPointers(
+      OpKernelContext* ctx, EmbeddingVar<TKey, T>* var,
+      EmbeddingVar<TKey, T>* accum, ValuePtr<T>** value_ptrs,
+      std::vector<std::list<int64>>& init_cursor_list,
+      T** v, T**a, const int64 task_size) {
+    uint64 main_thread_id = Env::Default()->GetCurrentThreadId();
+    auto do_work_get_ptrs =
+        [var, accum, value_ptrs, a, v,
+         &init_cursor_list, this,
+         main_thread_id] (int64 start, int64 limit) {
+      int copy_id =
+          thread_copy_id_alloc_->GetCopyIdOfThread(main_thread_id);
+      for (int i = start; i < limit; i++) {
+        bool is_need_set_default_value = false;
+        a[i] = accum->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        v[i] = var->LookupOrCreateEmb(
+            value_ptrs[i], var->GetDefaultValue(0));
+        if (is_need_set_default_value) {
+          init_cursor_list[copy_id].emplace_back(i);
+        }
+      }
+    };
+    const int64 unit_cost = 1000;
+    auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
+    Shard(worker_threads->num_threads,
+          worker_threads->workers,
+          task_size, unit_cost, do_work_get_ptrs);
+
+    // Merge copies of init_cursor_list
+    for (int i = 1; i < (worker_threads->num_threads + 1); i++) {
+      if (init_cursor_list[i].size() > 0) {
+        init_cursor_list[0].splice(init_cursor_list[0].end(),
+                                   init_cursor_list[i]);
+      }
+    }
+  }
+
+  void ApplyGradients(
+      EmbeddingVar<TKey, T>* var,
+      EmbeddingVar<TKey, T>* accum, T** v, T**a,
+      T lr_scalar, const T* grad_base,
+      const int64 task_size,
+      se::Stream* stream,
+      EventMgr* event_mgr,
+      const Eigen::GpuDevice& gpu_device) {
+    // Send pointers of embeddings to GPU
+    T** dev_v = (T**)var->GetBuffer(task_size * 2);
+    T** dev_a = dev_v + task_size;
+    CHECK(dev_a);
+    CHECK(dev_v);
+    DeviceMemoryBase dev_v_ptr(dev_v, sizeof(T*) * task_size * 2);
+    stream->ThenMemcpy(&dev_v_ptr, v, sizeof(T*) * task_size * 2);
+
+    int block_size = 128;
+    int embedding_dim = var->ValueLen();
+    functor::KvSparseApplyAdagradHbm<GPUDevice, TKey, T>()(
+            block_size, embedding_dim,
+            dev_a, dev_v, grad_base,
+            lr_scalar, task_size, gpu_device);
+    SyncWithEventMgr(stream, event_mgr);
   }
 
   void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
     auto locks =
         MaybeLockEmbeddingVariableInputMutexesInOrder<TKey, T>(ctx, use_exclusive_lock_, {0, 1});
 
-    EmbeddingVar<TKey, T>* var = NULL;
+    EmbeddingVar<TKey, T>* var = nullptr;
     OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 0, &var));
     core::ScopedUnref unref_var(var);
-    EmbeddingVar<TKey, T>* accum = NULL;
+    EmbeddingVar<TKey, T>* accum = nullptr;
     OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 1, &accum));
     core::ScopedUnref unref_accum(accum);
 
@@ -228,231 +311,94 @@ class KvSparseApplyAdagradGPUOp : public OpKernel {
 
     if (N > 0) {
       if (inner_dim > 0) {
-        if (var->IsHBMDRAM()) {
-          auto indices_flat = indices.flat<TKey>();
-          auto grad_flat = grad.flat_outer_dims<T>();
-          T lr_scalar = lr.scalar<T>()();
-          Tstep gs = global_step.scalar<Tstep>()();
+        auto indices_flat = indices.flat<TKey>();
+        auto grad_flat = grad.flat_outer_dims<T>();
+        Tstep gs = global_step.scalar<Tstep>()();
+        T lr_scalar = lr.scalar<T>()();
+        if (var->IsSingleHbm()) {
           const TKey* key_base = &indices_flat(0);
           const T* grad_base = &grad_flat(0);
-          int block_dim = 128;
-          int embedding_dim = var->ValueLen();
+          const Device& device = ctx->eigen_device<Device>();
 
-          TKey *ids = new TKey[N];
-          ValuePtr<T>** value_ptrs = new ValuePtr<T>*[N];
-          cudaMemcpy(ids, key_base, sizeof(TKey) * N, cudaMemcpyDeviceToHost);
-
-          auto do_work = [var, ids, value_ptrs, gs] (int64 start, int64 limit) {
-            ValuePtr<T>* value_ptr = nullptr;
-            for (int i = start; i < limit; i++) {
-              bool is_filter = false;
-              var->LookupOrCreateKey(ids[i], &value_ptr, &is_filter);
-              value_ptrs[i] = value_ptr;
-              var->UpdateVersion(value_ptr, gs);
-            }
-          };
-          const int64 cost = 1000; //very unreliable estimate for cost per step.
-          auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
-          Shard(worker_threads->num_threads,
-               worker_threads->workers, N, cost, do_work);
-
-          bool* init_flags = new bool[N]();
-          T** a = new T*[N];
-          T** v = new T*[N];
-          bool* copyback_flags = new bool[N];
-          T** accum_default_values = new T*[N];
-          auto do_work2 = [var, accum, value_ptrs, init_flags, a, v,
-            copyback_flags, accum_default_values] (int64 start, int64 limit) {
-            for (int i = start; i < limit; i++) {
-              a[i] = accum->LookupOrCreateEmb(value_ptrs[i], init_flags[i]);
-              v[i] = var->LookupOrCreateEmb(value_ptrs[i],
-                                            var->GetDefaultValue(0));
-              copyback_flags[i] = false;
-              accum_default_values[i] = accum->GetDefaultValue(i);
-            }
-          }; // Get V*
-          Shard(worker_threads->num_threads,
-                worker_threads->workers, N, cost, do_work2);
-          accum->InitailizeEmbeddingOnGPU(ids, N, init_flags,
-                                          a, accum_default_values);
-
-          T **dev_a, **dev_v;
-          T* default_value = accum->GetDefaultValue(0);
-          bool *dev_init_flags;
-          dev_init_flags = (bool*)var->GetBuffer1(N);
-          dev_a = (T**)var->GetBuffer2(N);
-          dev_v = (T**)var->GetBuffer3(N);
-          CHECK(dev_init_flags);
-          CHECK(dev_a);
-          CHECK(dev_v);
-          cudaMemcpy(dev_a, a, sizeof(T*) * N, cudaMemcpyHostToDevice);
-          cudaMemcpy(dev_v, v, sizeof(T*) * N, cudaMemcpyHostToDevice);
-          cudaMemcpy(dev_init_flags,
-                     init_flags, sizeof(bool) * N, cudaMemcpyHostToDevice);
-
-          void* args[] = { (void*)&dev_a, (void*)&dev_v,
-                           (void*)&grad_base, (void*)&lr_scalar,
-                           (void*)&embedding_dim, (void*)&N,
-                           (void*)&dev_init_flags, (void*)&default_value};
-          cudaLaunchKernel((void *)SparseApplyAdagradGPU<T>,
-                           (N + block_dim - 1) / block_dim * embedding_dim,
-                           block_dim, args, 0, NULL);
-          cudaDeviceSynchronize();
-
-          delete[] a;
-          delete[] v;
-          delete[] ids;
-          delete[] value_ptrs;
-          delete[] init_flags;
-          delete[] copyback_flags;
+          functor::KvSparseApplyAdagrad<Device, TKey, T>()(
+              N, ctx->get_allocator(AllocatorAttributes()), var, accum,
+              key_base, grad_base, lr_scalar, gs, device);
         } else {
-          auto indices_vec = indices.vec<TKey>();
-          auto grad_flat = grad.flat_outer_dims<T>();
-          T lr_scalar = lr.scalar<T>()();
-          Tstep gs = global_step.scalar<Tstep>()();
-          auto do_work = [this, ctx, &indices_vec, var, accum, &grad_flat,
-              &gs, &lr_scalar] (int64 start_i, int64 limit_i) {
-            for (int64 i = start_i; i < limit_i; i++) {
-              const TKey index = indices_vec(i);
-              ValuePtr<T>* value_ptr = nullptr;
-              bool is_filter = false;
-              OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
-              var->UpdateVersion(value_ptr, gs);
-              if (is_filter) {
-                auto a = accum->flat(value_ptr);
-                auto g = grad_flat.template chip<0>(i);
-                auto v = var->flat(value_ptr);
-                a += g.square();
-                v -= g.constant(lr_scalar) * g * a.rsqrt();
-                var->Commit(index, value_ptr);
-              }
-            }
-          };
-          const int64 cost = 1000; //very unreliable estimate for cost per step.
-          auto worker_threads = *(ctx->device()->tensorflow_cpu_worker_threads());
-          Shard(worker_threads.num_threads, worker_threads.workers, N, cost, do_work);
-        } // IsHBM_DRAM
+          ValuePtr<T>** value_ptrs = new ValuePtr<T>*[N];
+          TKey* indices_host = nullptr;
+          //Copy ids from GPU to CPU for CPU Lookup.
+          auto stream = ctx->op_device_context()->stream();
+          auto event_mgr = ctx->device()->tensorflow_gpu_device_info()->event_mgr;
+          if (!indices_as_pointer) {
+            indices_host = new TKey[N];
+            se::DeviceMemoryBase gpu_src(
+                const_cast<TKey*>(&indices_flat(0)), N * sizeof(TKey));
+            stream->ThenMemcpy(indices_host, gpu_src, N * sizeof(TKey));
+            SyncWithEventMgr(stream, event_mgr);
+          } else {
+            indices_host = const_cast<TKey*>(&indices_flat(0));
+          }
+          // Lookup ValuePtrs of ids and set version of each id  in parallel
+          LookupKeyAndSetVersion(ctx, var, value_ptrs,
+                                 gs, indices_host, N,
+                                 indices_as_pointer);
+
+          // Get pointers to embeddings and
+          // check which ids need to be initialized
+          T** v = new T*[N * 2];
+          T** a = v + N;
+          int num_worker_threads = ctx->device()
+                            ->tensorflow_cpu_worker_threads()
+                            ->num_threads;
+          std::vector<std::list<int64>> init_cursor_list(
+                                            num_worker_threads + 1);
+          LookupEmbeddingPointers(ctx, var, accum,
+                                  value_ptrs, init_cursor_list,
+                                  v, a, N);
+
+          accum->SetDefaultValueOfNewFeatures(
+              indices_host, N,
+              init_cursor_list[0],
+              a, accum->GetDefaultValuePtr(),
+              get_default_v_fn_, stream,
+              event_mgr, ctx->eigen_device<GPUDevice>());
+
+          ApplyGradients(
+              var, accum, v, a,
+              lr_scalar,
+              &grad_flat(0), N,
+              stream, event_mgr,
+              ctx->eigen_device<GPUDevice>());
+
+          delete[] v;
+          delete[] value_ptrs;
+          if (!indices_as_pointer) {
+            delete[] indices_host;
+          }
+        }
       }
     }
   }
 
  private:
   bool use_exclusive_lock_;
-};
-#define REGISTER_KERNELS(Tindices, T, Tstep)                         \
-  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdagrad")       \
-                              .Device(DEVICE_GPU)                    \
-                              .TypeConstraint<T>("T")                \
-                              .HostMemory("lr")                      \
-                              .HostMemory("global_step")             \
-                              .TypeConstraint<Tindices>("Tindices")  \
-                              .TypeConstraint<Tstep>("Tstep"),       \
-                          KvSparseApplyAdagradGPUOp<Tindices, T, Tstep>);
-#define REGISTER_GPU_KERNELS(T)        \
-  REGISTER_KERNELS(int32, T, int32);   \
-  REGISTER_KERNELS(int64, T, int32);   \
-  REGISTER_KERNELS(int32, T, int64);   \
-  REGISTER_KERNELS(int64, T, int64);
-
-TF_CALL_float(REGISTER_GPU_KERNELS);
-#undef REGISTER_GPU_KERNELS
-#undef REGISTER_KERNELS
-#endif  // TENSORFLOW_USE_GPU_EV
-#endif  // GOOGLE_CUDA
-
-#if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
-template <class K, class V>
-Status GetInputEmbeddingVarGPU(OpKernelContext* ctx, int input,
-                            EmbeddingVarGPU<K, V>** var) {
-  if (LookupResource(ctx, HandleFromInput(ctx, input), var).ok()) {
-    return Status::OK();
-  } else {
-    return errors::Internal("Invalid versioned variable reference.");
-  }
-}
-
-template <typename Device, typename TKey, typename T, typename Tstep>
-class KvSparseApplyAdagradOpGPU : public OpKernel {
- public:
-  explicit KvSparseApplyAdagradOpGPU(OpKernelConstruction* ctx) : OpKernel(ctx) {
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
-  }
-
-  void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
-    EmbeddingVarGPU<TKey, T>* var = NULL;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 0, &var));
-    EmbeddingVarGPU<TKey, T>* accum = NULL;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 1, &accum));
-
-    const Tensor& lr = ctx->input(2);
-    OP_REQUIRES(ctx, IsLegacyScalar(lr.shape()),
-                errors::InvalidArgument("lr is not a scalar: ",
-                                        lr.shape().DebugString()));
-    const Tensor& grad = ctx->input(3);
-    const Tensor& indices = ctx->input(4);
-    OP_REQUIRES(ctx, TensorShapeUtils::IsVector(indices.shape()),
-                errors::InvalidArgument("indices must be one-dimensional"));
-
-    const Tensor& global_step = ctx->input(5);
-    OP_REQUIRES(
-      ctx, IsLegacyScalar(global_step.shape()),
-      errors::InvalidArgument(
-        "global_step is not a scalar: ", global_step.shape().DebugString()));
-
-    int64 inner_dim = 1;
-    TensorShape var_shape({var->ValueLen()});
-    for (int d = 0; d < var_shape.dims(); d++) {
-      OP_REQUIRES(ctx, var_shape.dim_size(d) == grad.dim_size(d + 1),
-                  errors::InvalidArgument(strings::StrCat(
-                      "var and grad must match in dimension ", d + 1)));
-      inner_dim *= grad.dim_size(d + 1);
-    }
-
-    const int64 N = indices.dim_size(0);
-    OP_REQUIRES(
-        ctx, grad.dim_size(0) == N,
-        errors::InvalidArgument(
-            "grad must be the same size as indices in the first dimension."));
-
-    OP_REQUIRES(ctx, inner_dim > 0,
-                errors::InvalidArgument(
-                    "Inner dimension should be greater than zero."));
-
-    if (N > 0) {
-      if (inner_dim > 0) {
-        auto indices_flat = indices.flat<TKey>();
-        auto grad_flat = grad.flat<T>();
-        Tstep gs = global_step.scalar<Tstep>()();
-        const TKey* key_base = &indices_flat(0);
-        const T* grad_base = &grad_flat(0);
-        T lr_scalar = lr.scalar<T>()();
-        const cudaStream_t& stream = ctx->eigen_device<Device>().stream();
-
-        functor::KvSparseApplyAdagrad<Device, TKey, T>()(
-            N, ctx->get_allocator(AllocatorAttributes()), var, accum,
-            key_base, grad_base, lr_scalar, gs, stream);
-      }
-    }
-  }
-
- private:
-  bool use_exclusive_lock_;
+  ThreadCopyIdAllocator* thread_copy_id_alloc_ = nullptr;
+  std::function<T*(T*, TKey, int64, int64, int64)> get_default_v_fn_;
 };
 
 namespace functor {
 #define DECLARE_GPU_SPEC(TKey, T)                             \
-  template <>                                           \
+  template <>                                                 \
   void KvSparseApplyAdagrad<GPUDevice, TKey, T>::operator()(  \
-      int32 num_items,  \
-      Allocator* alloc, \
-      EmbeddingVarGPU<TKey, T>* var,  \
-      EmbeddingVarGPU<TKey, T>* accum,  \
-      const TKey* key_base, \
-      const T* grad,  \
-      T lr, \
-      int64 gs, \
-      cudaStream_t stream);             \
+      int32 num_items,                                        \
+      Allocator* alloc,                                       \
+      EmbeddingVar<TKey, T>* var,                             \
+      EmbeddingVar<TKey, T>* accum,                           \
+      const TKey* key_base,                                   \
+      const T* grad,                                          \
+      T lr,                                                   \
+      int64 gs,                                               \
+      const GPUDevice& device);                               \
   extern template struct KvSparseApplyAdagrad<GPUDevice, TKey, T>;
 DECLARE_GPU_SPEC(int32, float);
 DECLARE_GPU_SPEC(int32, double);
@@ -469,7 +415,16 @@ DECLARE_GPU_SPEC(int64, double);
                               .HostMemory("global_step")             \
                               .TypeConstraint<Tindices>("Tindices")  \
                               .TypeConstraint<Tstep>("Tstep"),       \
-                          KvSparseApplyAdagradOpGPU<GPUDevice, Tindices, T, Tstep>);
+                          KvSparseApplyAdagradGPUOp<GPUDevice, Tindices, T, Tstep, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdagrad")  \
+                              .Device(DEVICE_GPU)                    \
+                              .TypeConstraint<T>("T")                \
+                              .HostMemory("indices")                 \
+                              .HostMemory("lr")                      \
+                              .HostMemory("global_step")             \
+                              .TypeConstraint<Tindices>("Tindices")  \
+                              .TypeConstraint<Tstep>("Tstep"),       \
+                          KvSparseApplyAdagradGPUOp<GPUDevice, Tindices, T, Tstep, true>);
 #define REGISTER_GPU_KERNELS(T)        \
   REGISTER_KERNELS(int32, T, int32);   \
   REGISTER_KERNELS(int64, T, int32);   \
@@ -477,14 +432,12 @@ DECLARE_GPU_SPEC(int64, double);
   REGISTER_KERNELS(int64, T, int64);
 
 TF_CALL_float(REGISTER_GPU_KERNELS);
-
 #undef REGISTER_GPU_KERNELS
 #undef REGISTER_KERNELS
-#endif  // TENSORFLOW_USE_GPU_EV
 #endif  // GOOGLE_CUDA
 
 // Note, this op works on cpu only.
-template <typename Device, typename TKey, typename T, bool has_l2_shrinkage>
+template <typename Device, typename TKey, typename T, bool has_l2_shrinkage, bool indices_as_pointer>
 class KvSparseApplyFtrlOp : public OpKernel {
  public:
   explicit KvSparseApplyFtrlOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -591,7 +544,8 @@ class KvSparseApplyFtrlOp : public OpKernel {
             const TKey index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter = false;
-            OP_REQUIRES_OK(ctx, var_->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var_->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             if (is_filter) {
               auto var = var_->flat(value_ptr);
               auto accum = accum_->flat(value_ptr);
@@ -628,8 +582,7 @@ class KvSparseApplyFtrlOp : public OpKernel {
   } else {                                                                     \
     var = var.constant(static_cast<T>(0));                                     \
   }                                                                            \
-  accum += grad.square();                                                      \
-  var_->Commit(index, value_ptr);                                         
+  accum += grad.square();
               if (has_l2_shrinkage) {
                 auto grad_with_shrinkage =
                     grad + static_cast<T>(2) * l2_shrinkage_scalar * var;
@@ -661,7 +614,14 @@ class KvSparseApplyFtrlOp : public OpKernel {
           .Device(DEVICE_CPU)                                                 \
           .TypeConstraint<T>("T")                                             \
           .TypeConstraint<Tindices>("Tindices"),                              \
-      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/false>);
+      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/false, false>);\
+  REGISTER_KERNEL_BUILDER(                                                    \
+      Name("_OPT_KvResourceSparseApplyFtrl")                                  \
+          .Device(DEVICE_CPU)                                                 \
+          .TypeConstraint<T>("T")                                             \
+          .TypeConstraint<Tindices>("Tindices"),                              \
+      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/false, true>);
+
 #define REGISTER_CPU_KERNELS(T) \
   REGISTER_KERNELS(int64, T);   \
   REGISTER_KERNELS(int32, T);
@@ -677,7 +637,14 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
           .Device(DEVICE_CPU)                                                \
           .TypeConstraint<T>("T")                                            \
           .TypeConstraint<Tindices>("Tindices"),                             \
-      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/true>);
+      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/true, false>);\
+  REGISTER_KERNEL_BUILDER(                                                   \
+      Name("_OPT_KvResourceSparseApplyFtrlV2")                               \
+          .Device(DEVICE_CPU)                                                \
+          .TypeConstraint<T>("T")                                            \
+          .TypeConstraint<Tindices>("Tindices"),                             \
+      KvSparseApplyFtrlOp<CPUDevice, Tindices, T, /*has_l2_shrinkage=*/true, true>);
+
 #define REGISTER_CPU_KERNELS(T) \
   REGISTER_KERNELS(int64, T);   \
   REGISTER_KERNELS(int32, T);
@@ -688,8 +655,7 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 #undef REGISTER_KERNELS
 
 #if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
-template <typename Device, typename TKey, typename T, bool has_l2_shrinkage>
+template <typename Device, typename TKey, typename T, bool has_l2_shrinkage, bool indices_as_pointer>
 class KvSparseApplyFtrlOpGPU : public OpKernel {
  public:
   explicit KvSparseApplyFtrlOpGPU(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -697,12 +663,12 @@ class KvSparseApplyFtrlOpGPU : public OpKernel {
   }
 
   void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
-    EmbeddingVarGPU<TKey, T>* var_ = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 0, &var_));
-    EmbeddingVarGPU<TKey, T>* accum_ = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 1, &accum_));
-    EmbeddingVarGPU<TKey, T>* linear_ = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 2, &linear_));
+    EmbeddingVar<TKey, T>* var_ = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 0, &var_));
+    EmbeddingVar<TKey, T>* accum_ = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 1, &accum_));
+    EmbeddingVar<TKey, T>* linear_ = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 2, &linear_));
 
     const Tensor& grad = ctx->input(3);
     const Tensor& indices = ctx->input(4);
@@ -782,12 +748,12 @@ class KvSparseApplyFtrlOpGPU : public OpKernel {
         T lr_power_scalar = lr_power.scalar<T>()();
         const TKey* key_base = &indices_flat(0);
         const T* grad_base = &grad_flat(0);
-        const cudaStream_t& stream = ctx->eigen_device<Device>().stream();
+        const Device& device = ctx->eigen_device<Device>();
 
         functor::KvSparseApplyFtrl<Device, TKey, T>()(
             N, ctx->get_allocator(AllocatorAttributes()), var_, accum_, linear_,
             key_base, grad_base, lr_scalar, l1_scalar, l2_scalar, lr_power_scalar,
-            has_l2_shrinkage, l2_shrinkage_scalar, stream);
+            has_l2_shrinkage, l2_shrinkage_scalar, device);
       }
     }
 
@@ -799,23 +765,23 @@ class KvSparseApplyFtrlOpGPU : public OpKernel {
 };
 
 namespace functor {
-#define DECLARE_GPU_SPEC(TKey, T)                             \
-  template <>                                           \
-  void KvSparseApplyFtrl<GPUDevice, TKey, T>::operator()(  \
-      int32 num_items,  \
-      Allocator* alloc, \
-      EmbeddingVarGPU<TKey, T>* var,  \
-      EmbeddingVarGPU<TKey, T>* accum,  \
-      EmbeddingVarGPU<TKey, T>* linear, \
-      const TKey* key_base, \
-      const T* grad,  \
-      T lr, \
-      T l1, \
-      T l2, \
-      T lr_power, \
-      bool has_l2_shrinkage,  \
-      T l2_shrinkage, \
-      cudaStream_t stream);             \
+#define DECLARE_GPU_SPEC(TKey, T)                                          \
+  template <>                                                              \
+  void KvSparseApplyFtrl<GPUDevice, TKey, T>::operator()(                  \
+      int32 num_items,                                                     \
+      Allocator* alloc,                                                    \
+      EmbeddingVar<TKey, T>* var,                                          \
+      EmbeddingVar<TKey, T>* accum,                                        \
+      EmbeddingVar<TKey, T>* linear,                                       \
+      const TKey* key_base,                                                \
+      const T* grad,                                                       \
+      T lr,                                                                \
+      T l1,                                                                \
+      T l2,                                                                \
+      T lr_power,                                                          \
+      bool has_l2_shrinkage,                                               \
+      T l2_shrinkage,                                                      \
+      const GPUDevice& device);                                            \
   extern template struct KvSparseApplyFtrl<GPUDevice, TKey, T>;
 DECLARE_GPU_SPEC(int32, float);
 DECLARE_GPU_SPEC(int32, double);
@@ -824,47 +790,44 @@ DECLARE_GPU_SPEC(int64, double);
 #undef DECLARE_GPU_SPEC
 }  // namespace functor
 
-#define REGISTER_KERNELS(Tindices, T)                                         \
-  REGISTER_KERNEL_BUILDER(                                                    \
-      Name("KvResourceSparseApplyFtrl")                                       \
-          .Device(DEVICE_GPU)                                                 \
-          .TypeConstraint<T>("T")                                             \
-          .HostMemory("lr")                                                   \
-          .HostMemory("l1")                                                   \
-          .HostMemory("l2")                                                   \
-          .HostMemory("lr_power")                                             \
-          .TypeConstraint<Tindices>("Tindices"),                              \
-      KvSparseApplyFtrlOpGPU<GPUDevice, Tindices, T, /*has_l2_shrinkage=*/false>);
-#define REGISTER_CPU_KERNELS(T) \
-  REGISTER_KERNELS(int64, T);   \
+#define REGISTER_KERNELS(Tindices, T)                                      \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("KvResourceSparseApplyFtrl")                                    \
+          .Device(DEVICE_GPU)                                              \
+          .TypeConstraint<T>("T")                                          \
+          .HostMemory("lr")                                                \
+          .HostMemory("l1")                                                \
+          .HostMemory("l2")                                                \
+          .HostMemory("lr_power")                                          \
+          .TypeConstraint<Tindices>("Tindices"),                           \
+      KvSparseApplyFtrlOpGPU<GPUDevice, Tindices, T, false, false>);
+#define REGISTER_GPU_KERNELS(T)                                            \
+  REGISTER_KERNELS(int64, T);                                              \
   REGISTER_KERNELS(int32, T);
-
-TF_CALL_float(REGISTER_CPU_KERNELS);
-
-#undef REGISTER_CPU_KERNELS
+TF_CALL_float(REGISTER_GPU_KERNELS);
+TF_CALL_double(REGISTER_GPU_KERNELS);
+#undef REGISTER_GPU_KERNELS
 #undef REGISTER_KERNELS
 
-#define REGISTER_KERNELS(Tindices, T)                                        \
-  REGISTER_KERNEL_BUILDER(                                                   \
-      Name("KvResourceSparseApplyFtrlV2")                                    \
-          .Device(DEVICE_GPU)                                                \
-          .TypeConstraint<T>("T")                                            \
-          .HostMemory("lr")                                                  \
-          .HostMemory("l1")                                                  \
-          .HostMemory("l2")                                                  \
-          .HostMemory("lr_power")                                            \
-          .HostMemory("l2_shrinkage")                                        \
-          .TypeConstraint<Tindices>("Tindices"),                             \
-      KvSparseApplyFtrlOpGPU<GPUDevice, Tindices, T, /*has_l2_shrinkage=*/true>);
-#define REGISTER_CPU_KERNELS(T) \
-  REGISTER_KERNELS(int64, T);   \
+#define REGISTER_KERNELS(Tindices, T)                                      \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("KvResourceSparseApplyFtrlV2")                                  \
+          .Device(DEVICE_GPU)                                              \
+          .TypeConstraint<T>("T")                                          \
+          .HostMemory("lr")                                                \
+          .HostMemory("l1")                                                \
+          .HostMemory("l2")                                                \
+          .HostMemory("lr_power")                                          \
+          .HostMemory("l2_shrinkage")                                      \
+          .TypeConstraint<Tindices>("Tindices"),                           \
+      KvSparseApplyFtrlOpGPU<GPUDevice, Tindices, T, true, false>);
+#define REGISTER_GPU_KERNELS(T)                                            \
+  REGISTER_KERNELS(int64, T);                                              \
   REGISTER_KERNELS(int32, T);
-
-TF_CALL_float(REGISTER_CPU_KERNELS);
-
-#undef REGISTER_CPU_KERNELS
+TF_CALL_float(REGISTER_GPU_KERNELS);
+TF_CALL_double(REGISTER_GPU_KERNELS);
+#undef REGISTER_GPU_KERNELS
 #undef REGISTER_KERNELS
-#endif  // TENSORFLOW_USE_GPU_EV
 #endif  // GOOGLE_CUDA
 
 // Note, this op works on cpu only.
@@ -1204,7 +1167,7 @@ TF_CALL_double(REGISTER_CPU_KERNELS);
 #undef REGISTER_KERNELS
 
 // Note, this op works on cpu only.
-template <typename T, typename Tindex, typename Tstep>
+template <typename T, typename Tindex, typename Tstep, bool indices_as_pointer>
 class KvSparseApplyAdagradDecayOp : public OpKernel {
  public:
   explicit KvSparseApplyAdagradDecayOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -1298,7 +1261,8 @@ class KvSparseApplyAdagradDecayOp : public OpKernel {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter = false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             if (is_filter) {
               auto a = accum->flat(value_ptr);
 
@@ -1314,7 +1278,6 @@ class KvSparseApplyAdagradDecayOp : public OpKernel {
               }
               a += g.square();
               v -= g.constant(lr_scalar) * g * a.rsqrt();
-              var->Commit(index, value_ptr);
             }
           }
         };
@@ -1340,7 +1303,16 @@ class KvSparseApplyAdagradDecayOp : public OpKernel {
                               .TypeConstraint<T>("T")                      \
                               .TypeConstraint<Tindices>("Tindices")        \
                               .TypeConstraint<Tstep>("Tstep"),             \
-                          KvSparseApplyAdagradDecayOp<T, Tindices, Tstep>);
+                          KvSparseApplyAdagradDecayOp<T, Tindices, Tstep, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdagradDecay")   \
+                              .Device(DEVICE_CPU)                          \
+                              .HostMemory("var")                           \
+                              .HostMemory("accum")                         \
+                              .HostMemory("accum_decay_power")             \
+                              .TypeConstraint<T>("T")                      \
+                              .TypeConstraint<Tindices>("Tindices")        \
+                              .TypeConstraint<Tstep>("Tstep"),             \
+                          KvSparseApplyAdagradDecayOp<T, Tindices, Tstep, true>);
 
 #define REGISTER_CPU_KERNELS(T)        \
   REGISTER_KERNELS(T, int64, int32);   \
@@ -1353,7 +1325,7 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
 
-template <typename Device, typename T, typename Tindex>
+template <typename Device, typename T, typename Tindex, bool indices_as_pointer>
 class KvSparseApplyAdamOp : public OpKernel {
  public:
   explicit KvSparseApplyAdamOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -1461,7 +1433,8 @@ class KvSparseApplyAdamOp : public OpKernel {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter =false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             var->UpdateVersion(value_ptr, gs);
             if (is_filter) {
               auto var_i = var->flat(value_ptr);
@@ -1472,7 +1445,6 @@ class KvSparseApplyAdamOp : public OpKernel {
               m_a += (g - m_a) * (static_cast<T>(1) - beta1_scalar);
               v_a += (g.square() - v_a) * (static_cast<T>(1) - beta2_scalar);
               var_i -= (m_a * alpha) / (v_a.sqrt() + epsilon_scalar);
-              var->Commit(index, value_ptr);
             }
           }
         }
@@ -1489,11 +1461,17 @@ class KvSparseApplyAdamOp : public OpKernel {
 };
 
 #define REGISTER_KERNELS(T, Tindices)                                 \
-  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdam")             \
+  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdam")           \
                               .Device(DEVICE_CPU)                     \
                               .TypeConstraint<T>("T")                 \
                               .TypeConstraint<Tindices>("Tindices"),  \
-                          KvSparseApplyAdamOp<CPUDevice, T, Tindices>);
+                          KvSparseApplyAdamOp<CPUDevice, T, Tindices, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdam")      \
+                              .Device(DEVICE_CPU)                     \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamOp<CPUDevice, T, Tindices, true>);
+
 #define REGISTER_CPU_KERNELS(T) \
   REGISTER_KERNELS(T, int32);   \
   REGISTER_KERNELS(T, int64);
@@ -1502,6 +1480,297 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
+
+#if GOOGLE_CUDA
+template <typename Device, typename T, typename Tindex, bool indices_as_pointer>
+class KvSparseApplyAdamGPUOp : public OpKernel {
+ public:
+  explicit KvSparseApplyAdamGPUOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+
+    int num_worker_threads = ctx->device()
+                             ->tensorflow_cpu_worker_threads()
+                             ->num_threads;
+    thread_copy_id_alloc_ = new ThreadCopyIdAllocator(num_worker_threads);
+
+    get_default_v_fn_ =
+        [](T* default_v, Tindex id,
+          int64 index, int64 total_dim, int64 len) {
+      return default_v + len * (id % total_dim);
+    };
+  }
+
+  ~KvSparseApplyAdamGPUOp() {
+    delete thread_copy_id_alloc_;
+  }
+
+  void LookupEmbeddingPointers(
+      OpKernelContext* ctx, EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m, EmbeddingVar<Tindex, T>* v,
+      ValuePtr<T>** value_ptrs,
+      std::vector<std::list<int64>>& init_cursor_list,
+      T** var_ptr, T** m_ptr, T** v_ptr, const int64 task_size) {
+    uint64 main_thread_id = Env::Default()->GetCurrentThreadId();
+    auto do_work_get_ptrs =
+        [var, m, v, value_ptrs, var_ptr, m_ptr, v_ptr,
+         &init_cursor_list, this,
+         main_thread_id] (int64 start, int64 limit) {
+      int copy_id =
+          thread_copy_id_alloc_->GetCopyIdOfThread(main_thread_id);
+      for (int i = start; i < limit; i++) {
+        bool is_need_set_default_value = false;
+        m_ptr[i] = m->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        v_ptr[i] = v->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        var_ptr[i] = var->LookupOrCreateEmb(
+            value_ptrs[i], var->GetDefaultValue(0));
+        if (is_need_set_default_value) {
+          init_cursor_list[copy_id].emplace_back(i);
+        }
+      }
+    };
+    const int64 unit_cost = 1000;
+    auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
+    Shard(worker_threads->num_threads,
+          worker_threads->workers,
+          task_size, unit_cost, do_work_get_ptrs);
+
+    // Merge copies of init_cursor_list
+    for (int i = 1; i < (worker_threads->num_threads + 1); i++) {
+      if (init_cursor_list[i].size() > 0) {
+        init_cursor_list[0].splice(init_cursor_list[0].end(),
+                                   init_cursor_list[i]);
+      }
+    }
+  }
+
+  void ApplyGradients(
+      EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m,
+      EmbeddingVar<Tindex, T>* v,
+      T** var_ptr, T** m_ptr, T** v_ptr,
+      T alpha, T beta1, T beta2,
+      T epsilon, const T* grad_base,
+      const int64 task_size,
+      se::Stream* stream,
+      EventMgr* event_mgr,
+      const Eigen::GpuDevice& gpu_device) {
+    // Send pointers of embeddings to GPU
+    T** dev_var_ptr = (T**)var->GetBuffer(task_size * 3);
+    T** dev_m_ptr = dev_var_ptr + task_size;
+    T** dev_v_ptr = dev_m_ptr + task_size;
+    CHECK(dev_var_ptr);
+    CHECK(dev_m_ptr);
+    CHECK(dev_v_ptr);
+
+    DeviceMemoryBase dst_ptr(dev_var_ptr, sizeof(T*) * task_size * 3);
+    stream->ThenMemcpy(&dst_ptr, var_ptr, sizeof(T*) * task_size * 3);
+
+    int block_size = 128;
+    int embedding_dim = var->ValueLen();
+    void* args[] = {(void*)&dev_var_ptr, (void*)&dev_m_ptr,
+                    (void*)&dev_v_ptr, (void*)&grad_base,
+                    (void*)&alpha, (void*)&beta1, (void*)&beta2,
+                    (void*)&epsilon, (void*)&embedding_dim,
+                    (void*)&task_size};
+
+    functor::KvSparseApplyAdamHbm<GPUDevice, Tindex, T>()(
+        block_size, embedding_dim,
+        dev_var_ptr, dev_m_ptr, dev_v_ptr, grad_base,
+        alpha, beta1, beta2, epsilon,
+        task_size, gpu_device);
+    SyncWithEventMgr(stream, event_mgr);
+  }
+
+  void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
+    auto locks = MaybeLockEmbeddingVariableInputMutexesInOrder<Tindex, T>(ctx, use_exclusive_lock_,
+                                                      {0, 1, 2});
+    EmbeddingVar<Tindex, T>* var = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 0, &var));
+    core::ScopedUnref unref_var(var);
+
+    EmbeddingVar<Tindex, T>* m = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 1, &m));
+    core::ScopedUnref unref_m(m);
+
+    EmbeddingVar<Tindex, T>* v = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 2, &v));
+    core::ScopedUnref unref_v(v);
+
+    const Tensor& beta1_power = ctx->input(3);
+    const Tensor& beta2_power = ctx->input(4);
+    const Tensor& lr = ctx->input(5);
+    const Tensor& beta1 = ctx->input(6);
+    const Tensor& beta2 = ctx->input(7);
+    const Tensor& epsilon = ctx->input(8);
+    const Tensor& grad = ctx->input(9);
+    const Tensor& indices = ctx->input(10);
+    const Tensor& global_step = ctx->input(11);
+
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta1_power.shape()),
+        errors::InvalidArgument("beta1_power is not a scalar: ",
+                                beta1_power.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta2_power.shape()),
+        errors::InvalidArgument("beta2_power is not a scalar: ",
+                                beta2_power.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(lr.shape()),
+        errors::InvalidArgument("lr is not a scalar: ",
+                                lr.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta1.shape()),
+        errors::InvalidArgument("beta1 is not a scalar: ",
+                                beta1.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta2.shape()),
+        errors::InvalidArgument("beta2 is not a scalar: ",
+                                beta2.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(epsilon.shape()),
+        errors::InvalidArgument("epsilon is not a scalar: ",
+                                epsilon.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsVector(indices.shape()),
+        errors::InvalidArgument("indices must be one-dimensional"));
+    
+    OP_REQUIRES(ctx, !var->IsSingleHbm(), errors::InvalidArgument(
+        "Adam optimizer doesn't support EV with single-level HBM storage."));
+
+    int64 inner_dim = 1;
+    TensorShape var_shape({var->ValueLen()});
+    for (int d = 0; d < var_shape.dims(); d++) {
+      OP_REQUIRES(ctx, var_shape.dim_size(d) == grad.dim_size(d + 1),
+                  errors::InvalidArgument(strings::StrCat(
+                      "var and grad must match in dimension ", d + 1)));
+      inner_dim *= grad.dim_size(d + 1);
+    }
+    OP_REQUIRES(
+        ctx, inner_dim > 0,
+        errors::InvalidArgument(
+            "Inner dimension should be greater than zero."));
+
+    OP_REQUIRES(
+      ctx, IsLegacyScalar(global_step.shape()),
+      errors::InvalidArgument(
+        "global_step is not a scalar: ", global_step.shape().DebugString()));
+
+    const int64 N = indices.dim_size(0);
+    OP_REQUIRES(
+        ctx, grad.dim_size(0) == N,
+        errors::InvalidArgument(
+            "grad must be the same size as indices in the first dimension."));
+
+    if (N > 0) {
+      if (inner_dim > 0) {
+        auto indices_flat = indices.flat<Tindex>();
+        auto grad_flat = grad.flat_outer_dims<T>();
+        int64 gs = global_step.scalar<int64>()();
+        ValuePtr<T>** value_ptrs = new ValuePtr<T>*[N];
+        T beta1_power_scalar = beta1_power.scalar<T>()();
+        T beta2_power_scalar = beta2_power.scalar<T>()();
+        T lr_scalar = lr.scalar<T>()();
+        T beta1_scalar = beta1.scalar<T>()();
+        T beta2_scalar = beta2.scalar<T>()();
+        T epsilon_scalar = epsilon.scalar<T>()();
+        T alpha = lr_scalar *
+            Eigen::numext::sqrt(static_cast<T>(1) - beta2_power_scalar) /
+            (static_cast<T>(1) - beta1_power_scalar);
+
+        // Lookup ValuePtrs of ids and set version of each id  in parallel
+        LookupKeyAndSetVersion(ctx, var, value_ptrs,
+                               gs, indices_flat.data(), N,
+                               indices_as_pointer);
+
+        // Get pointers to embeddings and
+        // check which ids need to be initialized
+        T** var_ptr = new T*[N * 3];
+        T** m_ptr = var_ptr + N;
+        T** v_ptr = m_ptr + N;
+        int num_worker_threads = ctx->device()
+                                 ->tensorflow_cpu_worker_threads()
+                                 ->num_threads;
+        std::vector<std::list<int64>> init_cursor_list(
+            num_worker_threads + 1);
+        LookupEmbeddingPointers(ctx, var, m, v,
+                                value_ptrs, init_cursor_list,
+                                var_ptr, m_ptr, v_ptr, N);
+
+        auto stream = ctx->op_device_context()->stream();
+        auto event_mgr = ctx->device()->tensorflow_gpu_device_info()->event_mgr;
+
+        m->SetDefaultValueOfNewFeatures(
+            indices_flat.data(), N,
+            init_cursor_list[0],
+            m_ptr, m->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_gpu_device());
+
+        v->SetDefaultValueOfNewFeatures(
+            indices_flat.data(), N,
+            init_cursor_list[0],
+            v_ptr, v->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_gpu_device());
+
+        ApplyGradients(
+            var, m, v, var_ptr,
+            m_ptr, v_ptr, alpha,
+            beta1_scalar, beta2_scalar,
+            epsilon_scalar, &grad_flat(0), N,
+            stream, event_mgr,
+            ctx->eigen_gpu_device());
+
+        delete[] var_ptr;
+        delete[] value_ptrs;
+      }
+    }
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  ThreadCopyIdAllocator* thread_copy_id_alloc_ = nullptr;
+  std::function<T*(T*, Tindex, int64, int64, int64)> get_default_v_fn_;
+};
+
+#define REGISTER_KERNELS(T, Tindices)                                 \
+  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdam")             \
+                              .Device(DEVICE_GPU)                     \
+                              .HostMemory("indices")                 \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1_power")             \
+                              .HostMemory("beta2_power")             \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamGPUOp<GPUDevice, T, Tindices, false>); \
+   REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdam")           \
+                              .Device(DEVICE_GPU)                     \
+                              .HostMemory("indices")                 \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1_power")             \
+                              .HostMemory("beta2_power")             \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamGPUOp<GPUDevice, T, Tindices, true>);
+#define REGISTER_GPU_KERNELS(T) \
+  REGISTER_KERNELS(T, int32);   \
+  REGISTER_KERNELS(T, int64);
+
+TF_CALL_float(REGISTER_GPU_KERNELS);
+
+#undef REGISTER_GPU_KERNELS
+#undef REGISTER_KERNELS
+#endif  // GOOGLE_CUDA
 
 namespace functor {
 template <typename T>
@@ -1916,7 +2185,7 @@ class SparseApplyAdamAsyncOp : public OpKernel {
   bool apply_sparse_rmsprop_;
 };
 
-#define REGISTER_KERNELS(D, T, Tindices)                                      \
+#define REGISTER_KERNELS(D, T, Tindices)                                   \
   REGISTER_KERNEL_BUILDER(Name("SparseApplyAdamAsync")                     \
                               .Device(DEVICE_##D)                          \
                               .TypeConstraint<T>("T")                      \
@@ -1927,8 +2196,8 @@ class SparseApplyAdamAsyncOp : public OpKernel {
                               .TypeConstraint<T>("T")                      \
                               .TypeConstraint<Tindices>("Tindices"),       \
                           SparseApplyAdamAsyncOp<D##Device, T, Tindices>);
-#define REGISTER_CPU_KERNELS(T) \
-  REGISTER_KERNELS(CPU, T, int32);   \
+#define REGISTER_CPU_KERNELS(T)                                            \
+  REGISTER_KERNELS(CPU, T, int32);                                         \
   REGISTER_KERNELS(CPU, T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
@@ -1941,20 +2210,20 @@ TF_CALL_double(REGISTER_CPU_KERNELS);
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
-#define DECLARE_GPU_SPEC(T, Tindex) \
-  template <> \
-  Status SparseApplyAdamAsync<GPUDevice, T, Tindex>::operator()(const GPUDevice &d, \
-                  typename TTypes<T>::Matrix var, \
-                  typename TTypes<T>::Matrix m, typename TTypes<T>::Matrix v, \
-                  typename TTypes<T>::Scalar beta1_power, \
-                  typename TTypes<T>::Scalar beta2_power, \
-                  typename TTypes<T>::ConstScalar lr, \
-                  typename TTypes<T>::ConstScalar beta1, \
-                  typename TTypes<T>::ConstScalar beta2, \
-                  typename TTypes<T>::ConstScalar epsilon, \
-                  typename TTypes<T>::ConstMatrix grad, \
-                  typename TTypes<Tindex>::ConstVec indices_vec, \
-                  bool apply_sparse_rmsprop, int64 inner_dim); \
+#define DECLARE_GPU_SPEC(T, Tindex)                                                \
+  template <>                                                                      \
+  Status SparseApplyAdamAsync<GPUDevice, T, Tindex>::operator()(const GPUDevice &d,\
+                  typename TTypes<T>::Matrix var,                                  \
+                  typename TTypes<T>::Matrix m, typename TTypes<T>::Matrix v,      \
+                  typename TTypes<T>::Scalar beta1_power,                          \
+                  typename TTypes<T>::Scalar beta2_power,                          \
+                  typename TTypes<T>::ConstScalar lr,                              \
+                  typename TTypes<T>::ConstScalar beta1,                           \
+                  typename TTypes<T>::ConstScalar beta2,                           \
+                  typename TTypes<T>::ConstScalar epsilon,                         \
+                  typename TTypes<T>::ConstMatrix grad,                            \
+                  typename TTypes<Tindex>::ConstVec indices_vec,                   \
+                  bool apply_sparse_rmsprop, int64 inner_dim);                     \
   extern template struct SparseApplyAdamAsync<GPUDevice, T, Tindex>;
 
 DECLARE_GPU_SPEC(Eigen::half, int32);
@@ -1966,8 +2235,8 @@ DECLARE_GPU_SPEC(double, int64);
 #undef DECLARE_GPU_SPEC
 } // end of namespace functor
 
-#define REGISTER_GPU_KERNEL(T) \
-  REGISTER_KERNELS(GPU, T, int32); \
+#define REGISTER_GPU_KERNEL(T)                                                     \
+  REGISTER_KERNELS(GPU, T, int32);                                                 \
   REGISTER_KERNELS(GPU, T, int64);
 
 TF_CALL_half(REGISTER_GPU_KERNEL);
@@ -1978,7 +2247,7 @@ TF_CALL_double(REGISTER_GPU_KERNEL);
 #endif // End of #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #undef REGISTER_KERNELS
 
-template <typename Device, typename T, typename Tindex, typename Tstep>
+template <typename Device, typename T, typename Tindex, typename Tstep, bool indices_as_pointer>
 class KvSparseApplyAdamAsyncOp : public OpKernel {
  public:
   explicit KvSparseApplyAdamAsyncOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -2088,7 +2357,8 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter = false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             var->UpdateVersion(value_ptr, gs);
             if (is_filter) {
               auto v_ = v->flat(value_ptr);
@@ -2103,7 +2373,6 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
 
               auto v = var->flat(value_ptr);
               v -= m_;
-              var->Commit(index, value_ptr);
             }
           }
         };
@@ -2137,7 +2406,8 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
               const Tindex index = indices_vec(i);
               ValuePtr<T>* value_ptr = nullptr;
               bool is_filter = false;
-              OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+              OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                             &is_filter, indices_as_pointer));
               var->UpdateVersion(value_ptr, gs);
               if (is_filter) {
                 auto m_a = m->flat(value_ptr);
@@ -2148,7 +2418,6 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
                 m_a = m_a * beta1_scalar + g * (static_cast<T>(1) - beta1_scalar);
                 v_a = v_a * beta2_scalar + g.square() * (static_cast<T>(1) - beta2_scalar);
                 var_i -= (m_a * alpha) / (v_a.sqrt() + epsilon_scalar);
-                var->Commit(index, value_ptr);
               }
             }
           }
@@ -2171,14 +2440,21 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
   bool apply_sparse_rmsprop_;
 };
 
-#define REGISTER_KERNELS(D, T, Tindices, Tstep)                             \
+#define REGISTER_KERNELS(D, T, Tindices, Tstep)                            \
   REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdamAsync")           \
                               .Device(DEVICE_##D)                          \
                               .TypeConstraint<T>("T")                      \
                               .TypeConstraint<Tindices>("Tindices")        \
                               .TypeConstraint<Tstep>("Tstep"),             \
-                          KvSparseApplyAdamAsyncOp<D##Device, T, Tindices, Tstep>);
-#define REGISTER_CPU_KERNELS(T)        \
+                          KvSparseApplyAdamAsyncOp<D##Device, T, Tindices, Tstep, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdamAsync")      \
+                              .Device(DEVICE_##D)                          \
+                              .TypeConstraint<T>("T")                      \
+                              .TypeConstraint<Tindices>("Tindices")        \
+                              .TypeConstraint<Tstep>("Tstep"),             \
+                          KvSparseApplyAdamAsyncOp<D##Device, T, Tindices, Tstep, true>);
+
+#define REGISTER_CPU_KERNELS(T)             \
   REGISTER_KERNELS(CPU, T, int32, int32);   \
   REGISTER_KERNELS(CPU, T, int64, int32);   \
   REGISTER_KERNELS(CPU, T, int32, int64);   \
@@ -2193,28 +2469,131 @@ TF_CALL_double(REGISTER_CPU_KERNELS);
 #undef REGISTER_KERNELS
 
 #if GOOGLE_CUDA
-#if TENSORFLOW_USE_GPU_EV
-template <typename Device, typename T, typename Tindex, typename Tstep>
-class KvSparseApplyAdamAsyncOpGPU : public OpKernel {
+template <typename Device, typename T, typename Tindex, typename Tstep, bool indices_as_pointer>
+class KvSparseApplyAdamAsyncGPUOp : public OpKernel {
  public:
-  explicit KvSparseApplyAdamAsyncOpGPU(OpKernelConstruction* ctx) : OpKernel(ctx) {
+  explicit KvSparseApplyAdamAsyncGPUOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("apply_sparse_rmsprop", &apply_sparse_rmsprop_));
+
+    int num_worker_threads = ctx->device()
+                             ->tensorflow_cpu_worker_threads()
+                             ->num_threads;
+    thread_copy_id_alloc_ = new ThreadCopyIdAllocator(num_worker_threads);
+
+    get_default_v_fn_ =
+        [](T* default_v, Tindex id,
+          int64 index, int64 total_dim, int64 len) {
+      return default_v + len * (id % total_dim);
+    };
+  }
+
+  ~KvSparseApplyAdamAsyncGPUOp() {
+    delete thread_copy_id_alloc_;
+  }
+
+  void LookupEmbeddingPointers(
+      OpKernelContext* ctx, EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m, EmbeddingVar<Tindex, T>* v,
+      ValuePtr<T>** value_ptrs,
+      std::vector<std::list<int64>>& init_cursor_list,
+      T** var_ptr, T** m_ptr, T** v_ptr, const int64 task_size) {
+    uint64 main_thread_id = Env::Default()->GetCurrentThreadId();
+    auto do_work_get_ptrs =
+        [var, m, v, value_ptrs, var_ptr, m_ptr, v_ptr,
+         &init_cursor_list, this,
+         main_thread_id] (int64 start, int64 limit) {
+      int copy_id =
+          thread_copy_id_alloc_->GetCopyIdOfThread(main_thread_id);
+      for (int i = start; i < limit; i++) {
+        bool is_need_set_default_value = false;
+        m_ptr[i] = m->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        v_ptr[i] = v->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        var_ptr[i] = var->LookupOrCreateEmb(
+            value_ptrs[i], var->GetDefaultValue(0));
+        if (is_need_set_default_value) {
+          init_cursor_list[copy_id].emplace_back(i);
+        }
+      }
+    };
+    const int64 unit_cost = 1000;
+    auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
+    Shard(worker_threads->num_threads,
+          worker_threads->workers,
+          task_size, unit_cost, do_work_get_ptrs);
+
+    // Merge copies of init_cursor_list
+    for (int i = 1; i < (worker_threads->num_threads + 1); i++) {
+      if (init_cursor_list[i].size() > 0) {
+        init_cursor_list[0].splice(init_cursor_list[0].end(),
+                                   init_cursor_list[i]);
+      }
+    }
+  }
+
+  void ApplyGradients(
+      EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m,
+      EmbeddingVar<Tindex, T>* v,
+      T** var_ptr, T** m_ptr, T** v_ptr,
+      T beta1, T beta2,
+      T epsilon, T lr,
+      typename TTypes<T>::Scalar beta1_power_scalar,
+      typename TTypes<T>::Scalar beta2_power_scalar,
+      const T* grad_base,
+      const int64 task_size,
+      se::Stream* stream,
+      EventMgr* event_mgr,
+      const Eigen::GpuDevice& gpu_device) {
+    // Send pointers of embeddings to GPU
+    T** dev_var_ptr = (T**)var->GetBuffer(task_size * 3);
+    T** dev_m_ptr = dev_var_ptr + task_size;
+    T** dev_v_ptr = dev_m_ptr + task_size;
+    CHECK(dev_var_ptr);
+    CHECK(dev_m_ptr);
+    CHECK(dev_v_ptr);
+
+    DeviceMemoryBase dst_ptr(dev_var_ptr, sizeof(T*) * task_size * 3);
+    stream->ThenMemcpy(&dst_ptr, var_ptr, sizeof(T*) * task_size * 3);
+
+    int block_size = 128;
+    int embedding_dim = var->ValueLen();
+    T* beta1_power_ptr = beta1_power_scalar.data();
+    T* beta2_power_ptr = beta2_power_scalar.data();
+    if (apply_sparse_rmsprop_) {
+      functor::KvSparseApplyAdamAsyncSparseRmspropHbm<GPUDevice, Tindex, T>()(
+          block_size, embedding_dim,
+          dev_var_ptr, dev_m_ptr, dev_v_ptr,
+          grad_base, lr, beta1,
+          beta2, epsilon, task_size,
+          gpu_device);
+    } else {
+     functor::KvSparseApplyAdamAsyncHbm<GPUDevice, Tindex, T>()(
+          block_size, embedding_dim,
+          dev_var_ptr, dev_m_ptr, dev_v_ptr,
+          grad_base, lr, beta1,
+          beta2, epsilon, beta1_power_ptr,
+          beta2_power_ptr, task_size,
+          gpu_device);
+    }
+    SyncWithEventMgr(stream, event_mgr);
   }
 
   void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
     auto locks = MaybeLockEmbeddingVariableInputMutexesInOrder<Tindex, T>(
       ctx, use_exclusive_lock_, {0, 1, 2, 3, 4});
-    EmbeddingVarGPU<Tindex, T>* var = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 0, &var));
+    EmbeddingVar<Tindex, T>* var = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 0, &var));
     core::ScopedUnref unref_var(var);
 
-    EmbeddingVarGPU<Tindex, T>* m = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 1, &m));
+    EmbeddingVar<Tindex, T>* m = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 1, &m));
     core::ScopedUnref unref_m(m);
 
-    EmbeddingVarGPU<Tindex, T>* v = nullptr;
-    OP_REQUIRES_OK(ctx, GetInputEmbeddingVarGPU(ctx, 2, &v));
+    EmbeddingVar<Tindex, T>* v = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 2, &v));
     core::ScopedUnref unref_v(v);
 
     Tensor beta1_power;
@@ -2280,64 +2659,166 @@ class KvSparseApplyAdamAsyncOpGPU : public OpKernel {
         errors::InvalidArgument(
             "global_step is not a scalar: ", global_step.shape().DebugString()));
 
-    const Tindex N = indices.dim_size(0);
+    const int64 N = indices.dim_size(0);
     OP_REQUIRES(
         ctx, grad.dim_size(0) == N,
         errors::InvalidArgument(
             "grad must be the same size as indices in the first dimension."));
 
-    const Device& device = ctx->eigen_device<Device>();
-    OP_REQUIRES_OK(ctx,
-      functor::KvSparseApplyAdamAsync<Device, T, Tindex, Tstep>()(
-        device, var, m, v, beta1_power.scalar<T>(), beta2_power.scalar<T>(),
-        indices.vec<Tindex>(), grad.flat_outer_dims<T>(), lr.scalar<T>(),
-        beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
-        global_step.scalar<Tstep>(), apply_sparse_rmsprop_, inner_dim,
-        ctx->get_allocator(AllocatorAttributes())));
+    if (N > 0) {
+      if (var->IsSingleHbm()) {
+        const Device& device = ctx->eigen_device<Device>();
+        OP_REQUIRES_OK(ctx,
+        functor::KvSparseApplyAdamAsync<Device, T, Tindex, Tstep>()(
+          device, var, m, v, beta1_power.scalar<T>(), beta2_power.scalar<T>(),
+          indices.vec<Tindex>(), grad.flat_outer_dims<T>(), lr.scalar<T>(),
+          beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
+          global_step.scalar<Tstep>(), apply_sparse_rmsprop_, inner_dim,
+          ctx->get_allocator(AllocatorAttributes())));
+      } else {
+        auto indices_vec = indices.vec<Tindex>();
+        auto grad_flat = grad.flat_outer_dims<T>();
+        Tstep gs = global_step.scalar<int64>()();
+        const T lr_scalar = lr.scalar<T>()();
+        const T beta1_scalar = beta1.scalar<T>()();
+        const T beta2_scalar = beta2.scalar<T>()();
+        const T epsilon_scalar = epsilon.scalar<T>()();
+        auto beta1_power_scalar = beta1_power.scalar<T>();
+        auto beta2_power_scalar = beta2_power.scalar<T>();
+
+        ValuePtr<T>** value_ptrs = new ValuePtr<T>*[N];
+        Tindex* indices_host = new Tindex[N];
+        volatile bool is_cpu_indices_ready = false;
+        //Copy ids from GPU to CPU for CPU Lookup.
+        auto stream = ctx->op_device_context()->stream();
+        auto event_mgr = ctx->device()->tensorflow_gpu_device_info()->event_mgr;
+        se::DeviceMemoryBase gpu_src(
+            const_cast<Tindex*>(indices_vec.data()), N * sizeof(Tindex));
+        stream->ThenMemcpy(indices_host, gpu_src, N * sizeof(Tindex));
+        SyncWithEventMgr(stream, event_mgr);
+        // Lookup ValuePtrs of ids and set version of each id  in parallel
+        LookupKeyAndSetVersion(ctx, var, value_ptrs,
+                               gs, indices_host, N,
+                               indices_as_pointer);
+
+        // Get pointers to embeddings and
+        // check which ids need to be initialized
+        T** var_ptr = new T*[N * 3];
+        T** m_ptr = var_ptr + N;
+        T** v_ptr = m_ptr + N;
+        int num_worker_threads = ctx->device()
+                                 ->tensorflow_cpu_worker_threads()
+                                 ->num_threads;
+        std::vector<std::list<int64>> init_cursor_list(
+            num_worker_threads + 1);
+        LookupEmbeddingPointers(ctx, var, m, v,
+                                value_ptrs, init_cursor_list,
+                                var_ptr, m_ptr, v_ptr, N);
+
+        m->SetDefaultValueOfNewFeatures(
+            indices_host, N,
+            init_cursor_list[0],
+            m_ptr, m->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_device<GPUDevice>());
+
+        v->SetDefaultValueOfNewFeatures(
+            indices_host, N,
+            init_cursor_list[0],
+            v_ptr, v->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_device<GPUDevice>());
+
+        ApplyGradients(
+            var, m, v, var_ptr,
+            m_ptr, v_ptr,
+            beta1_scalar, beta2_scalar,
+            epsilon_scalar, lr_scalar,
+            beta1_power_scalar,
+            beta2_power_scalar,
+            &grad_flat(0), N,
+            stream, event_mgr,
+            ctx->eigen_device<GPUDevice>());
+
+        delete[] var_ptr;
+        delete[] value_ptrs;
+        delete[] indices_host;
+      }
+    }
     MaybeForwardRefInputToRefOutput(ctx, 0, 0);
   }
 
  private:
   bool use_exclusive_lock_;
   bool apply_sparse_rmsprop_;
+  ThreadCopyIdAllocator* thread_copy_id_alloc_ = nullptr;
+  std::function<T*(T*, Tindex, int64, int64, int64)> get_default_v_fn_;
 };
 
 #define REGISTER_KERNELS(D, T, Tindices, Tstep)                             \
   REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdamAsync")           \
                               .Device(DEVICE_##D)                          \
-                              .HostMemory("global_step")                   \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
                               .TypeConstraint<T>("T")                      \
                               .TypeConstraint<Tindices>("Tindices")        \
                               .TypeConstraint<Tstep>("Tstep"),             \
-                          KvSparseApplyAdamAsyncOpGPU<D##Device, T, Tindices, Tstep>);
+                          KvSparseApplyAdamAsyncGPUOp<D##Device, T, Tindices, Tstep, false>); \
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdamAsync")           \
+                              .Device(DEVICE_##D)                          \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
+                              .TypeConstraint<T>("T")                      \
+                              .TypeConstraint<Tindices>("Tindices")        \
+                              .TypeConstraint<Tstep>("Tstep"),             \
+                          KvSparseApplyAdamAsyncGPUOp<D##Device, T, Tindices, Tstep, true>);
+#define REGISTER_GPU_KERNELS(T)        \
+  REGISTER_KERNELS(GPU, T, int32, int32);   \
+  REGISTER_KERNELS(GPU, T, int64, int32);   \
+  REGISTER_KERNELS(GPU, T, int32, int64);   \
+  REGISTER_KERNELS(GPU, T, int64, int64);
+
+TF_CALL_float(REGISTER_GPU_KERNELS);
+TF_CALL_double(REGISTER_GPU_KERNELS);
+
+#undef REGISTER_GPU_KERNELS
+#undef REGISTER_KERNELS
+#endif  // GOOGLE_CUDA
+
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
-#define DECLARE_GPU_SPEC(T, Tindex, Tstep) \
-  template <> \
-  Status KvSparseApplyAdamAsync<GPUDevice, T, Tindex, Tstep>::operator()( \
-                    const GPUDevice &d, \
-                    EmbeddingVarGPU<Tindex, T> *var, \
-                    EmbeddingVarGPU<Tindex, T> *m, \
-                    EmbeddingVarGPU<Tindex, T> *v, \
-                    typename TTypes<T>::Scalar beta1_power_scalar, \
-                    typename TTypes<T>::Scalar beta2_power_scalar, \
-                    typename TTypes<Tindex>::ConstVec indices_vec, \
-                    typename TTypes<T>::ConstMatrix grad, \
-                    typename TTypes<T>::ConstScalar lr_scalar, \
-                    typename TTypes<T>::ConstScalar beta1_scalar, \
-                    typename TTypes<T>::ConstScalar beta2_scalar, \
-                    typename TTypes<T>::ConstScalar epsilon_scalar, \
-                    typename TTypes<Tstep>::ConstScalar global_step_scalar, \
-                    bool apply_sparse_rmsprop, const int64 inner_dim, \
-                    Allocator *alloc); \
+#define DECLARE_GPU_SPEC(T, Tindex, Tstep)                                 \
+  template <>                                                              \
+  Status KvSparseApplyAdamAsync<GPUDevice, T, Tindex, Tstep>::operator()(  \
+                    const GPUDevice &d,                                    \
+                    EmbeddingVar<Tindex, T> *var,                          \
+                    EmbeddingVar<Tindex, T> *m,                            \
+                    EmbeddingVar<Tindex, T> *v,                            \
+                    typename TTypes<T>::Scalar beta1_power_scalar,         \
+                    typename TTypes<T>::Scalar beta2_power_scalar,         \
+                    typename TTypes<Tindex>::ConstVec indices_vec,         \
+                    typename TTypes<T>::ConstMatrix grad,                  \
+                    typename TTypes<T>::ConstScalar lr_scalar,             \
+                    typename TTypes<T>::ConstScalar beta1_scalar,          \
+                    typename TTypes<T>::ConstScalar beta2_scalar,          \
+                    typename TTypes<T>::ConstScalar epsilon_scalar,        \
+                    typename TTypes<Tstep>::ConstScalar global_step_scalar,\
+                    bool apply_sparse_rmsprop, const int64 inner_dim,      \
+                    Allocator *alloc);                                     \
   extern template struct KvSparseApplyAdamAsync<GPUDevice, T, Tindex, Tstep>;
 
-#define DECLARE_GPU_SPEC_TYPE(T) \
-  DECLARE_GPU_SPEC(T, int32, int32); \
-  DECLARE_GPU_SPEC(T, int32, int64); \
-  DECLARE_GPU_SPEC(T, int64, int32); \
+#define DECLARE_GPU_SPEC_TYPE(T)                                           \
+  DECLARE_GPU_SPEC(T, int32, int32);                                       \
+  DECLARE_GPU_SPEC(T, int32, int64);                                       \
+  DECLARE_GPU_SPEC(T, int64, int32);                                       \
   DECLARE_GPU_SPEC(T, int64, int64);
 
 DECLARE_GPU_SPEC_TYPE(float);
@@ -2347,23 +2828,9 @@ DECLARE_GPU_SPEC_TYPE(double);
 #undef DECLARE_GPU_SPEC
 } // end of namespace functor
 
-#define REGISTER_GPU_KERNEL(T) \
-  REGISTER_KERNELS(GPU, T, int32, int32); \
-  REGISTER_KERNELS(GPU, T, int32, int64); \
-  REGISTER_KERNELS(GPU, T, int64, int32); \
-  REGISTER_KERNELS(GPU, T, int64, int64);
-
-TF_CALL_float(REGISTER_GPU_KERNEL);
-TF_CALL_double(REGISTER_GPU_KERNEL);
-
-#undef REGISTER_GPU_KERNEL
 #endif // End of GOOGLE_CUDA || TENSORFLOW_USE_ROCM
-#undef REGISTER_KERNELS
 
-#endif // TENSORFLOW_USE_GPU_EV
-#endif // GOOGLE_CUDA
-
-template <typename T, typename Tindex, typename Tstep>
+template <typename T, typename Tindex, typename Tstep, bool indices_as_pointer>
 class KvResourceSparseApplyGradientDescentOp : public OpKernel {
  public:
   explicit KvResourceSparseApplyGradientDescentOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -2426,13 +2893,13 @@ class KvResourceSparseApplyGradientDescentOp : public OpKernel {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter = false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             var->UpdateVersion(value_ptr, gs);
             if (is_filter) {
               auto g = grad_flat.template chip<0>(i);
               auto v = var->flat(value_ptr);
               v -= g.constant(lr_scalar) * g;
-              var->Commit(index, value_ptr);
             }
           }
         };
@@ -2456,7 +2923,14 @@ class KvResourceSparseApplyGradientDescentOp : public OpKernel {
                               .TypeConstraint<T>("T")                      \
                               .TypeConstraint<Tindices>("Tindices")        \
                               .TypeConstraint<Tstep>("Tstep"),             \
-                          KvResourceSparseApplyGradientDescentOp<T, Tindices, Tstep>);
+                          KvResourceSparseApplyGradientDescentOp<T, Tindices, Tstep, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyGradientDescent")\
+                              .Device(DEVICE_CPU)                          \
+                              .HostMemory("var")                           \
+                              .TypeConstraint<T>("T")                      \
+                              .TypeConstraint<Tindices>("Tindices")        \
+                              .TypeConstraint<Tstep>("Tstep"),             \
+                          KvResourceSparseApplyGradientDescentOp<T, Tindices, Tstep, true>);
 
 #define REGISTER_CPU_KERNELS(T)        \
   REGISTER_KERNELS(T, int64, int32);   \
@@ -2469,7 +2943,7 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
 
-template <typename Device, typename T, typename Tindex>
+template <typename Device, typename T, typename Tindex, bool indices_as_pointer>
 class KvSparseApplyAdamWOp : public OpKernel {
  public:
   explicit KvSparseApplyAdamWOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -2584,7 +3058,8 @@ class KvSparseApplyAdamWOp : public OpKernel {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
             bool is_filter =false;
-            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr, &is_filter));
+            OP_REQUIRES_OK(ctx, var->LookupOrCreateKey(index, &value_ptr,
+                           &is_filter, indices_as_pointer));
             var->UpdateVersion(value_ptr, gs);
             if (is_filter) {
               auto var_i = var->flat(value_ptr);
@@ -2596,7 +3071,6 @@ class KvSparseApplyAdamWOp : public OpKernel {
               // v_a = beta2 * v + (1 - beta2) * (g * g)
               v_a += (g.square() - v_a) * (static_cast<T>(1) - beta2_scalar);
               var_i -= (m_a * alpha) / (v_a.sqrt() + epsilon_scalar) + weight_decay_scalar * var_i;
-              var->Commit(index, value_ptr);
             }
           }
         }
@@ -2613,11 +3087,17 @@ class KvSparseApplyAdamWOp : public OpKernel {
 };
 
 #define REGISTER_KERNELS(T, Tindices)                                 \
-  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdamW")             \
+  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdamW")          \
                               .Device(DEVICE_CPU)                     \
                               .TypeConstraint<T>("T")                 \
                               .TypeConstraint<Tindices>("Tindices"),  \
-                          KvSparseApplyAdamWOp<CPUDevice, T, Tindices>);
+                          KvSparseApplyAdamWOp<CPUDevice, T, Tindices, false>);\
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdamW")     \
+                              .Device(DEVICE_CPU)                     \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamWOp<CPUDevice, T, Tindices, true>);
+
 #define REGISTER_CPU_KERNELS(T) \
   REGISTER_KERNELS(T, int32);   \
   REGISTER_KERNELS(T, int64);
@@ -2626,5 +3106,296 @@ TF_CALL_float(REGISTER_CPU_KERNELS);
 
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
+
+#if GOOGLE_CUDA
+template <typename Device, typename T, typename Tindex, bool indices_as_pointer>
+class KvSparseApplyAdamWGPUOp : public OpKernel {
+ public:
+  explicit KvSparseApplyAdamWGPUOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+
+    int num_worker_threads = ctx->device()
+                             ->tensorflow_cpu_worker_threads()
+                             ->num_threads;
+    thread_copy_id_alloc_ = new ThreadCopyIdAllocator(num_worker_threads);
+
+    get_default_v_fn_ =
+        [](T* default_v, Tindex id,
+          int64 index, int64 total_dim, int64 len) {
+      return default_v + len * (id % total_dim);
+    };
+  }
+
+  ~KvSparseApplyAdamWGPUOp() {
+    delete thread_copy_id_alloc_;
+  }
+
+  void LookupEmbeddingPointers(
+      OpKernelContext* ctx, EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m, EmbeddingVar<Tindex, T>* v,
+      ValuePtr<T>** value_ptrs,
+      std::vector<std::list<int64>>& init_cursor_list,
+      T** var_ptr, T** m_ptr, T** v_ptr, const int64 task_size) {
+    uint64 main_thread_id = Env::Default()->GetCurrentThreadId();
+    auto do_work_get_ptrs =
+        [var, m, v, value_ptrs, var_ptr, m_ptr, v_ptr,
+         &init_cursor_list, this,
+         main_thread_id] (int64 start, int64 limit) {
+      int copy_id =
+          thread_copy_id_alloc_->GetCopyIdOfThread(main_thread_id);
+      for (int i = start; i < limit; i++) {
+        bool is_need_set_default_value = false;
+        m_ptr[i] = m->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        v_ptr[i] = v->LookupOrCreateEmb(
+            value_ptrs[i], is_need_set_default_value);
+        var_ptr[i] = var->LookupOrCreateEmb(
+            value_ptrs[i], var->GetDefaultValue(0));
+        if (is_need_set_default_value) {
+          init_cursor_list[copy_id].emplace_back(i);
+        }
+      }
+    };
+    const int64 unit_cost = 1000;
+    auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
+    Shard(worker_threads->num_threads,
+          worker_threads->workers,
+          task_size, unit_cost, do_work_get_ptrs);
+
+    // Merge copies of init_cursor_list
+    for (int i = 1; i < (worker_threads->num_threads + 1); i++) {
+      if (init_cursor_list[i].size() > 0) {
+        init_cursor_list[0].splice(init_cursor_list[0].end(),
+                                   init_cursor_list[i]);
+      }
+    }
+  }
+
+  void ApplyGradients(
+      EmbeddingVar<Tindex, T>* var,
+      EmbeddingVar<Tindex, T>* m,
+      EmbeddingVar<Tindex, T>* v,
+      T** var_ptr, T** m_ptr, T** v_ptr,
+      T alpha, T beta1, T beta2,
+      T epsilon, T weight_decay,
+      const T* grad_base,
+      const int64 task_size,
+      se::Stream* stream,
+      EventMgr* event_mgr,
+      const Eigen::GpuDevice& gpu_device) {
+    // Send pointers of embeddings to GPU
+    T** dev_var_ptr = (T**)var->GetBuffer(task_size * 3);
+    T** dev_m_ptr = dev_var_ptr + task_size;
+    T** dev_v_ptr = dev_m_ptr + task_size;
+    CHECK(dev_var_ptr);
+    CHECK(dev_m_ptr);
+    CHECK(dev_v_ptr);
+
+    DeviceMemoryBase dst_ptr(dev_var_ptr, sizeof(T*) * task_size * 3);
+    stream->ThenMemcpy(&dst_ptr, var_ptr, sizeof(T*) * task_size * 3);
+
+    int block_size = 128;
+    int embedding_dim = var->ValueLen();
+    functor::KvSparseApplyAdamWHbm<GPUDevice, Tindex, T>()(
+            block_size, embedding_dim,
+            dev_var_ptr, dev_m_ptr, dev_v_ptr, grad_base,
+            alpha, beta1, beta2, epsilon, weight_decay,
+            task_size, gpu_device);
+    SyncWithEventMgr(stream, event_mgr);
+  }
+
+  void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
+    auto locks = MaybeLockEmbeddingVariableInputMutexesInOrder<Tindex, T>(ctx, use_exclusive_lock_,
+                                                      {0, 1, 2});
+    EmbeddingVar<Tindex, T>* var = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 0, &var));
+    core::ScopedUnref unref_var(var);
+
+    EmbeddingVar<Tindex, T>* m = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 1, &m));
+    core::ScopedUnref unref_m(m);
+
+    EmbeddingVar<Tindex, T>* v = nullptr;
+    OP_REQUIRES_OK(ctx, GetInputEmbeddingVar(ctx, 2, &v));
+    core::ScopedUnref unref_v(v);
+
+    const Tensor& beta1_power = ctx->input(3);
+    const Tensor& beta2_power = ctx->input(4);
+    const Tensor& lr = ctx->input(5);
+    const Tensor& beta1 = ctx->input(6);
+    const Tensor& beta2 = ctx->input(7);
+    const Tensor& epsilon = ctx->input(8);
+    const Tensor& grad = ctx->input(9);
+    const Tensor& indices = ctx->input(10);
+    const Tensor& global_step = ctx->input(11);
+    const Tensor& weight_decay = ctx->input(12);
+
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta1_power.shape()),
+        errors::InvalidArgument("beta1_power is not a scalar: ",
+                                beta1_power.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta2_power.shape()),
+        errors::InvalidArgument("beta2_power is not a scalar: ",
+                                beta2_power.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(lr.shape()),
+        errors::InvalidArgument("lr is not a scalar: ",
+                                lr.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta1.shape()),
+        errors::InvalidArgument("beta1 is not a scalar: ",
+                                beta1.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(beta2.shape()),
+        errors::InvalidArgument("beta2 is not a scalar: ",
+                                beta2.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsScalar(epsilon.shape()),
+        errors::InvalidArgument("epsilon is not a scalar: ",
+                                epsilon.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, TensorShapeUtils::IsVector(indices.shape()),
+        errors::InvalidArgument("indices must be one-dimensional"));
+
+    int64 inner_dim = 1;
+    TensorShape var_shape({var->ValueLen()});
+    for (int d = 0; d < var_shape.dims(); d++) {
+      OP_REQUIRES(ctx, var_shape.dim_size(d) == grad.dim_size(d + 1),
+                  errors::InvalidArgument(strings::StrCat(
+                      "var and grad must match in dimension ", d + 1)));
+      inner_dim *= grad.dim_size(d + 1);
+    }
+    OP_REQUIRES(
+        ctx, inner_dim > 0,
+        errors::InvalidArgument(
+            "Inner dimension should be greater than zero."));
+
+    OP_REQUIRES(
+      ctx, IsLegacyScalar(global_step.shape()),
+      errors::InvalidArgument(
+        "global_step is not a scalar: ", global_step.shape().DebugString()));
+
+    const int64 N = indices.dim_size(0);
+    OP_REQUIRES(
+        ctx, grad.dim_size(0) == N,
+        errors::InvalidArgument(
+            "grad must be the same size as indices in the first dimension."));
+    
+    OP_REQUIRES(ctx, !var->IsSingleHbm(), errors::InvalidArgument(
+        "AdamW optimizer doesn't support EV with single-level HBM storage."));
+
+    if (N > 0) {
+      if (inner_dim > 0) {
+        auto indices_flat = indices.flat<Tindex>();
+        auto grad_flat = grad.flat_outer_dims<T>();
+        int64 gs = global_step.scalar<int64>()();
+        ValuePtr<T>** value_ptrs = new ValuePtr<T>*[N];
+        T beta1_power_scalar = beta1_power.scalar<T>()();
+        T beta2_power_scalar = beta2_power.scalar<T>()();
+        T lr_scalar = lr.scalar<T>()();
+        T beta1_scalar = beta1.scalar<T>()();
+        T beta2_scalar = beta2.scalar<T>()();
+        T epsilon_scalar = epsilon.scalar<T>()();
+        T weight_decay_scalar = weight_decay.scalar<T>()();
+        const T alpha = lr_scalar *
+            Eigen::numext::sqrt(static_cast<T>(1) - beta2_power_scalar) /
+            (static_cast<T>(1) - beta1_power_scalar);
+
+        // Lookup ValuePtrs of ids and set version of each id  in parallel
+        LookupKeyAndSetVersion(ctx, var, value_ptrs,
+                               gs, indices_flat.data(), N,
+                               indices_as_pointer);
+
+        // Get pointers to embeddings and
+        // check which ids need to be initialized
+        T** var_ptr = new T*[N * 3];
+        T** m_ptr = var_ptr + N;
+        T** v_ptr = m_ptr + N;
+        int num_worker_threads = ctx->device()
+                                 ->tensorflow_cpu_worker_threads()
+                                 ->num_threads;
+        std::vector<std::list<int64>> init_cursor_list(
+            num_worker_threads + 1);
+        LookupEmbeddingPointers(ctx, var, m, v,
+                                value_ptrs, init_cursor_list,
+                                var_ptr, m_ptr, v_ptr, N);
+
+        auto stream = ctx->op_device_context()->stream();
+        auto event_mgr = ctx->device()->tensorflow_gpu_device_info()->event_mgr;
+
+        m->SetDefaultValueOfNewFeatures(
+            indices_flat.data(), N,
+            init_cursor_list[0],
+            m_ptr, m->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_gpu_device());
+
+        v->SetDefaultValueOfNewFeatures(
+            indices_flat.data(), N,
+            init_cursor_list[0],
+            v_ptr, v->GetDefaultValuePtr(),
+            get_default_v_fn_, stream,
+            event_mgr, ctx->eigen_gpu_device());
+
+        ApplyGradients(
+            var, m, v, var_ptr,
+            m_ptr, v_ptr, alpha,
+            beta1_scalar, beta2_scalar,
+            epsilon_scalar, weight_decay_scalar,
+            &grad_flat(0), N,
+            stream, event_mgr,
+            ctx->eigen_gpu_device());
+
+        delete[] var_ptr;
+        delete[] value_ptrs;
+      }
+    }
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  ThreadCopyIdAllocator* thread_copy_id_alloc_ = nullptr;
+  std::function<T*(T*, Tindex, int64, int64, int64)> get_default_v_fn_;
+};
+
+#define REGISTER_KERNELS(T, Tindices)                                 \
+  REGISTER_KERNEL_BUILDER(Name("KvResourceSparseApplyAdamW")             \
+                              .Device(DEVICE_GPU)                     \
+                              .HostMemory("indices")                 \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1_power")             \
+                              .HostMemory("beta2_power")             \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
+                              .HostMemory("weight_decay")            \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamWGPUOp<GPUDevice, T, Tindices, false>); \
+  REGISTER_KERNEL_BUILDER(Name("_OPT_KvResourceSparseApplyAdamW")             \
+                              .Device(DEVICE_GPU)                     \
+                              .HostMemory("indices")                 \
+                              .HostMemory("lr")                      \
+                              .HostMemory("beta1_power")             \
+                              .HostMemory("beta2_power")             \
+                              .HostMemory("beta1")                   \
+                              .HostMemory("beta2")                   \
+                              .HostMemory("epsilon")                 \
+                              .HostMemory("global_step")             \
+                              .HostMemory("weight_decay")            \
+                              .TypeConstraint<T>("T")                 \
+                              .TypeConstraint<Tindices>("Tindices"),  \
+                          KvSparseApplyAdamWGPUOp<GPUDevice, T, Tindices, true>);
+#define REGISTER_GPU_KERNELS(T) \
+  REGISTER_KERNELS(T, int32);   \
+  REGISTER_KERNELS(T, int64);
+
+TF_CALL_float(REGISTER_GPU_KERNELS);
+
+#undef REGISTER_GPU_KERNELS
+#undef REGISTER_KERNELS
+#endif  // GOOGLE_CUDA
 
 }  // namespace tensorflow

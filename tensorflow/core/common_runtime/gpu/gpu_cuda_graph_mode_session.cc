@@ -1,4 +1,4 @@
-/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2022 The DeepRec Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ class CudaGraphModeSessionFactory : public SessionFactory {
 
   Status NewSessionGroup(const SessionOptions& options,
                          SessionGroup** out_session_group,
-                         int session_num = 1) override {
+                         const SessionGroupMetadata& metadata) override {
     return errors::Internal(
         "NewSessionGroup method not implemented in GraphModeSessionFactory.");
   }

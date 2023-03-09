@@ -33,10 +33,13 @@ struct ModelSession {
   virtual ~ModelSession();
 
   Status Predict(Request& req, Response& resp);
+  Status Predict(Request& req, Response& resp, int sess_id);
   Status LocalPredict(Request& req, Response& resp);
+  Status LocalPredict(Request& req, Response& resp, int sess_id);
   Version GetVersion() {return version_;}
   void UpdateVersion(const Version& v) { version_ = v; }
-  Session* GetSession();
+  std::vector<Session*> GetLeaderSessions();
+  Status Warmup(Request& req, Response& resp, bool local=true);
 
   SessionGroup* session_group_ = nullptr;
   SelectSessionPolicy select_session_policy_ =
@@ -54,6 +57,8 @@ struct ModelSession {
 
  private:
   int GetServingSessionId();
+  Status InternalPredict(Request& req, Response& resp, int sess_id);
+  Status InternalLocalPredict(Request& req, Response& resp, int sess_id);
 };
 
 class ModelSessionMgr {
@@ -64,6 +69,7 @@ class ModelSessionMgr {
 
   Status Predict(Request& req, Response& resp);
   Status LocalPredict(Request& req, Response& resp);
+  Status Warmup(Request& req, Response& resp, bool local=true);
 
   Status CreateModelSession(
       const Version& version,
@@ -86,12 +92,13 @@ class ModelSessionMgr {
   Status CreateModelSession(
       const Version& version, const char* full_ckpt_name,
       const char* incr_ckpt_name, bool is_incr_ckpt,
-      ModelConfig* config);
+      bool is_initialize, ModelConfig* config);
  
   Status CreateModelSession(
       const Version& version, const char* full_ckpt_name,
       const char* incr_ckpt_name, bool is_incr_ckpt,
-      ModelConfig* config, ModelSession** new_model_session);
+      bool is_initialize, ModelConfig* config,
+      ModelSession** new_model_session);
 
   Status CleanupModelSession();
 
@@ -115,7 +122,7 @@ class ModelSessionMgr {
   void ClearLoop();
 
  protected:
-  ModelSession* serving_session_ = nullptr;
+  ModelSession* serving_model_session_ = nullptr;
 
   MetaGraphDef meta_graph_def_;
   SessionOptions* session_options_;

@@ -394,6 +394,52 @@ Status FractionalMaxPoolGradHelper(const Scope& scope, const Operation& op,
 }
 REGISTER_GRADIENT_OP("FractionalMaxPool", FractionalMaxPoolGradHelper);
 
+Status Conv2DBackpropInputGrad(const Scope& scope, const Operation& op,
+                               const std::vector<Output>& grad_inputs,
+                               std::vector<Output>* grad_outputs) {
+  if (op.num_inputs() != 3) {
+    return errors::InvalidArgument("Conv2DBackpropInput requires 3 inputs.");
+  }
+  if (grad_inputs.empty()) {
+    return errors::InvalidArgument(
+        "Conv2DBackpropInput grad requires 1 grad input");
+  }
+
+  std::vector<int> dilations, strides, explicit_paddings;
+  bool use_cudnn_on_gpu;
+  std::string data_format, padding;
+  TF_RETURN_IF_ERROR(GetNodeAttr(op.node()->attrs(), "dilations", &dilations));
+  TF_RETURN_IF_ERROR(GetNodeAttr(op.node()->attrs(), "strides", &strides));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(op.node()->attrs(), "explicit_paddings", &explicit_paddings));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(op.node()->attrs(), "use_cudnn_on_gpu", &use_cudnn_on_gpu));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(op.node()->attrs(), "data_format", &data_format));
+  TF_RETURN_IF_ERROR(GetNodeAttr(op.node()->attrs(), "padding", &padding));
+
+  grad_outputs->push_back(NoGradient());
+
+  Conv2DBackpropFilter::Attrs filter_attrs;
+  filter_attrs.use_cudnn_on_gpu_ = use_cudnn_on_gpu;
+  filter_attrs.explicit_paddings_ = explicit_paddings;
+  filter_attrs.data_format_ = data_format;
+  filter_attrs.dilations_ = dilations;
+  grad_outputs->push_back(
+      Conv2DBackpropFilter(scope, grad_inputs[0], Shape(scope, op.input(1)),
+                           op.input(2), strides, padding, filter_attrs));
+
+  Conv2D::Attrs conv_attrs;
+  conv_attrs.use_cudnn_on_gpu_ = use_cudnn_on_gpu;
+  conv_attrs.explicit_paddings_ = explicit_paddings;
+  conv_attrs.data_format_ = data_format;
+  conv_attrs.dilations_ = dilations;
+  grad_outputs->push_back(
+      Conv2D(scope, grad_inputs[0], op.input(1), strides, padding, conv_attrs));
+  return scope.status();
+}
+REGISTER_GRADIENT_OP("Conv2DBackpropInput", Conv2DBackpropInputGrad);
+
 }  // anonymous namespace
 }  // namespace ops
 }  // namespace tensorflow

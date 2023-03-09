@@ -350,6 +350,13 @@ config_setting(
 )
 
 config_setting(
+    name = "using_cuda_serving",
+    define_values = {
+        "using_cuda_serving": "true",
+    },
+)
+
+config_setting(
     name = "using_cuda_clang",
     define_values = {
         "using_cuda_clang": "true",
@@ -428,12 +435,6 @@ config_setting(
 )
 
 config_setting(
-    name = "with_gpu_ev_support",
-    values = {"define": "with_gpu_ev_support=true"},
-    visibility = ["//visibility:public"],
-)
-
-config_setting(
     name = "with_pmem_support",
     values = {"define": "with_pmem_support=true"},
     visibility = ["//visibility:public"],
@@ -454,6 +455,12 @@ config_setting(
 config_setting(
     name = "override_eigen_strong_inline",
     values = {"define": "override_eigen_strong_inline=true"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "with_api_compatible",
+    values = {"define": "with_api_compatible=true"},
     visibility = ["//visibility:public"],
 )
 
@@ -693,8 +700,6 @@ tf_cc_shared_object(
         "//tensorflow/cc:scope",
         "//tensorflow/cc/profiler",
         "//tensorflow/core:tensorflow",
-        # Triton dependencies
-        "//triton:triton_tf",
         "//tensorflow/contrib:contrib_kernels",
         "//tensorflow/contrib:contrib_ops_op_lib",
         "//tensorflow/contrib/tensor_forest:stats_ops_lib",

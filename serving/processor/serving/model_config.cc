@@ -34,6 +34,18 @@ Status AddOSSAccessPrefix(std::string& dir,
                         tmp.substr(offset));
   return Status::OK();
 }
+
+void ParseGPUIds(const std::string& gpu_ids_list,
+                 std::vector<size_t>* gpu_ids) {
+  if (!gpu_ids_list.empty()) {
+    std::vector<string> ids =
+        str_util::Split(gpu_ids_list, ',');
+    for (auto id : ids) {
+      gpu_ids->emplace_back(std::stoi(id));
+    }
+  }
+}
+
 }
 
 Status ModelConfigFactory::Create(const char* model_config, ModelConfig** config) {
@@ -54,12 +66,32 @@ Status ModelConfigFactory::Create(const char* model_config, ModelConfig** config
 
   *config = new ModelConfig;
 
+  // User set session group cpuset,
+  // Usage: "0-10;11-20;21-30" or
+  //        "0,1,2,3;4,5,6,7;8,9,10"
+  if (!json_config["cpusets"].isNull()) {
+    (*config)->cpusets =
+      json_config["cpusets"].asString();
+  }
+
   if (!json_config["session_num"].isNull()) {
     (*config)->session_num =
       json_config["session_num"].asInt();
   } else {
     (*config)->session_num = 1;
   }
+
+  if (!json_config["gpu_ids_list"].isNull()) {
+    std::string gpu_ids_list =
+      json_config["gpu_ids_list"].asString();
+    ParseGPUIds(gpu_ids_list, &((*config)->gpu_ids));
+  }
+
+  bool use_multi_stream = false;
+  if (!json_config["use_multi_stream"].isNull()) {
+    use_multi_stream = json_config["use_multi_stream"].asBool();
+  }
+  (*config)->use_multi_stream = use_multi_stream;
 
   (*config)->select_session_policy = "MOD";
   if (!json_config["select_session_policy"].isNull()) {
@@ -111,6 +143,20 @@ Status ModelConfigFactory::Create(const char* model_config, ModelConfig** config
       json_config["intra_op_parallelism_threads"].asInt();
   } else {
     (*config)->intra_threads = schedule_threads / 2;
+  }
+
+  if (!json_config["model_update_inter_threads"].isNull()) {
+    (*config)->model_update_inter_threads =
+      json_config["model_update_inter_threads"].asInt();
+  } else {
+    (*config)->model_update_inter_threads = 0;
+  }
+
+  if (!json_config["model_update_intra_threads"].isNull()) {
+    (*config)->model_update_intra_threads =
+      json_config["model_update_intra_threads"].asInt();
+  } else {
+    (*config)->model_update_intra_threads = 0;
   }
 
   if (!json_config["init_timeout_minutes"].isNull()) {
@@ -377,7 +423,7 @@ Status ModelConfigFactory::Create(const char* model_config, ModelConfig** config
   if (!json_config["ev_storage_type"].isNull()) {
     auto st = json_config["ev_storage_type"].asInt();
     switch (st) {
-      case embedding::StorageType::INVALID:
+      case embedding::StorageType::DEFAULT:
         break;
       case embedding::StorageType::DRAM:
         (*config)->storage_type = embedding::StorageType::DRAM;

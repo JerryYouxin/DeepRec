@@ -26,6 +26,9 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/util/mkl_types.h"
 #include "tensorflow/core/util/mkl_util.h"
+#ifdef DNNL_AARCH64_USE_ACL
+#include "tensorflow/core/platform/mutex.h"
+#endif
 
 using dnnl::inner_product_backward_weights;
 using dnnl::inner_product_forward;
@@ -57,6 +60,7 @@ struct MklDnnMatMulFwdParams {
   MEMORY_FORMAT weight_format;
   MEMORY_FORMAT dst_format;
   string dtypes = string("");
+  bool const_weight;
   struct PostOpParam {
     string name;
     std::vector<float> param;
@@ -67,14 +71,16 @@ struct MklDnnMatMulFwdParams {
                         memory::dims bias_dims, memory::dims dst_dims,
                         MEMORY_FORMAT src_format = MEMORY_FORMAT::any,
                         MEMORY_FORMAT weight_format = MEMORY_FORMAT::any,
-                        MEMORY_FORMAT dst_format = MEMORY_FORMAT::any)
+                        MEMORY_FORMAT dst_format = MEMORY_FORMAT::any,
+                        bool const_weight = false)
       : src_dims(src_dims),
         weight_dims(weight_dims),
         bias_dims(bias_dims),
         dst_dims(dst_dims),
         src_format(src_format),
         weight_format(weight_format),
-        dst_format(dst_format) {}
+        dst_format(dst_format),
+        const_weight(const_weight) {}
 };
 
 // With quantization, input, weight, bias, and output can have different types.
@@ -106,6 +112,9 @@ class MklDnnMatMulFwdPrimitive : public MklPrimitive {
   void Execute(const Tinput* src_data, const Tweight* weight_data,
                const Tbias* bias_data, Toutput* dst_data,
                std::shared_ptr<stream> fwd_stream) {
+#ifdef DNNL_AARCH64_USE_ACL
+    mutex_lock lock(primitive_execution_mu_);
+#endif
 #ifdef ENABLE_DNNL_THREADPOOL
     context_.src_mem->set_data_handle(
         static_cast<void*>(const_cast<Tinput*>(src_data)), *fwd_stream);
@@ -199,7 +208,8 @@ class MklDnnMatMulFwdPrimitive : public MklPrimitive {
                                             MEMORY_FORMAT::any));
     // Create an inner-product.
     context_.fwd_desc.reset(new inner_product_forward::desc(
-        prop_kind::forward_inference, *context_.src_md, *context_.weight_md,
+        matmul_fwd_params.const_weight ? prop_kind::forward_inference : prop_kind::forward_training,
+        *context_.src_md, *context_.weight_md,
         *context_.bias_md, *context_.dst_md));
     context_.fwd_pd.reset(new inner_product_forward::primitive_desc(
         *context_.fwd_desc, cpu_engine_));
@@ -303,6 +313,11 @@ class MklDnnMatMulFwdPrimitive : public MklPrimitive {
   }
 
   struct MklDnnMatMulFwdContext context_;
+
+#ifdef DNNL_AARCH64_USE_ACL
+  // Guards Execution()
+  mutex primitive_execution_mu_;
+#endif
 };
 
 template <typename T, typename Tinput, typename Tweight, typename Tbias,
@@ -564,6 +579,9 @@ class MklMatMulPrimitive : public MklPrimitive {
 
   void Execute(const T* a_data, const T* b_data, T* c_data,
                std::shared_ptr<stream> stream) {
+#ifdef DNNL_AARCH64_USE_ACL
+    mutex_lock lock(primitive_execution_mu_);
+#endif
 #ifdef ENABLE_DNNL_THREADPOOL
     context_.a_mem->set_data_handle(static_cast<void*>(const_cast<T*>(a_data)),
                                     *stream);
@@ -582,6 +600,11 @@ class MklMatMulPrimitive : public MklPrimitive {
     context_.a_mem->set_data_handle(DummyData);
     context_.b_mem->set_data_handle(DummyData);
     context_.c_mem->set_data_handle(DummyData);
+  }
+
+  std::shared_ptr<dnnl::matmul::primitive_desc>
+  GetPrimitiveDesc() const {
+    return context_.prim_desc;
   }
 
  private:
@@ -674,6 +697,10 @@ class MklMatMulPrimitive : public MklPrimitive {
   }
 
   struct MklMatMulContext context_;
+
+#ifdef DNNL_AARCH64_USE_ACL
+  mutex primitive_execution_mu_;
+#endif
 };
 
 template <typename T>
